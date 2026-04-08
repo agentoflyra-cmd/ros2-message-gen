@@ -1,9 +1,58 @@
+
 # ROS2 Message Generator for Rust
 
 A standalone Rust crate for generating Rust code from ROS2 `.msg` and `.srv` files.
 The generator writes one Rust crate per ROS package into the output directory, with clean
 cross-package type references such as
 `geometry_msgs::msg::Quaternion`.
+
+
+
+### Motivation
+
+Most existing ROS 2 message generators in Rust are tightly coupled with the DDS/RMW ecosystem, focusing on enabling runtime communication.
+
+This project explores a different direction:
+
+> treating ROS 2 messages as a **wire format** rather than a runtime abstraction.
+
+The goal is to build a lightweight Rust toolchain that can:
+
+* generate Rust structs from `.msg` definitions
+* decode ROS 2 CDR-encoded message payloads
+* work without requiring a full ROS 2 installation
+
+This is particularly motivated by use cases such as:
+
+* offline rosbag / MCAP processing
+* SLAM and robotics data pipelines
+* dataset conversion and analysis
+
+---
+
+### Current Status
+
+⚠️ This project is in an early stage.
+
+At the moment, it is focused on:
+
+* parsing `.msg` definitions
+* generating Rust struct representations
+* experimenting with a minimal CDR decoding layer
+
+Many features are incomplete or subject to change.
+
+---
+
+### Design Direction (WIP)
+
+The long-term direction is to:
+
+* decouple message handling from ROS 2 runtime
+* provide deterministic, inspectable decoding
+* enable integration with non-ROS data pipelines
+
+
 
 ## Features
 
