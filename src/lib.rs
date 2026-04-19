@@ -10,6 +10,7 @@
 //! - Support for arrays and complex types
 //! - Generate one crate per ROS package
 //! - Auto-generate package `Cargo.toml` files and local `path` dependencies
+//! - Emit a placeholder `decode.rs` for future backend integration
 //! - Configurable naming conventions
 //!
 //! # Quick Start

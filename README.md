@@ -61,7 +61,7 @@ The long-term direction is to:
 - Generate one crate per ROS package under the output directory
 - Cross-package type references (e.g. `geometry_msgs::msg::Quaternion`)
 - Auto-generate per-package `Cargo.toml` files and cross-package `path` dependencies
-- Placeholder `rmw` trait for future backend integration
+- Placeholder `decode.rs` for future backend integration
 - Configurable naming conventions
 - Standalone binary tool
 - Library integration
@@ -119,26 +119,20 @@ generated_ws/
 │   ├── Cargo.toml
 │   └── src
 │       ├── lib.rs
+│       ├── decode.rs
 │       ├── msg.rs
-│       ├── msg
-│       │   └── rmw.rs
-│       ├── srv.rs
-│       └── srv
-│           └── rmw.rs
+│       └── srv.rs
 └── sensor_msgs
     ├── Cargo.toml
     └── src
         ├── lib.rs
-        ├── msg.rs
-        ├── msg
-        │   └── rmw.rs
         ├── srv.rs
-        └── srv
-            └── rmw.rs
+        ├── msg.rs
+        └── decode.rs
 ```
 
-`msg/rmw.rs` and `srv/rmw.rs` contain a placeholder trait for deserialization backend
-integration and intentionally do not bind to `rosidl_runtime_rs` by default.
+`decode.rs` contains a placeholder trait for deserialization backend integration and does
+not bind to a concrete CDR backend yet.
 
 Each package crate gets its own `Cargo.toml`, and any referenced ROS package is added as a
 local `path` dependency.

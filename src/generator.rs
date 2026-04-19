@@ -52,9 +52,8 @@ impl MessageGenerator {
     /// `output_path` 现在表示输出目录，会生成以下布局：
     /// - `src/lib.rs`
     /// - `src/msg.rs`
-    /// - `src/msg/rmw.rs`
     /// - `src/srv.rs`
-    /// - `src/srv/rmw.rs`
+    /// - `src/decode.rs`
     pub fn new(output_path: String) -> Self {
         Self {
             output_path,
@@ -226,11 +225,7 @@ impl MessageGenerator {
         services: &[(&MessageType, &MessageType)],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let src_dir = crate_dir.join("src");
-        let msg_dir = src_dir.join("msg");
-        let srv_dir = src_dir.join("srv");
-
-        fs::create_dir_all(&msg_dir)?;
-        fs::create_dir_all(&srv_dir)?;
+        fs::create_dir_all(&src_dir)?;
 
         let package_name = crate_dir
             .file_name()
@@ -242,13 +237,15 @@ impl MessageGenerator {
             package_manifest(package_name, &dependencies),
         )?;
 
-        fs::write(src_dir.join("lib.rs"), "pub mod msg;\npub mod srv;\n")?;
+        fs::write(
+            src_dir.join("lib.rs"),
+            "pub mod decode;\npub mod msg;\npub mod srv;\n",
+        )?;
 
         let mut msg_rs = String::new();
         msg_rs.push_str("#![allow(unused_imports)]\n");
         msg_rs.push_str("#[cfg(feature = \"serde\")]\n");
         msg_rs.push_str("use serde::{Deserialize, Serialize};\n\n");
-        msg_rs.push_str("pub mod rmw;\n\n");
 
         for msg in messages {
             msg_rs.push_str(&msg.to_rust_struct_with_impl(
@@ -263,7 +260,6 @@ impl MessageGenerator {
         srv_rs.push_str("#[cfg(feature = \"serde\")]\n");
         srv_rs.push_str("use serde::{Deserialize, Serialize};\n");
         srv_rs.push_str("use crate::msg::*;\n\n");
-        srv_rs.push_str("pub mod rmw;\n\n");
 
         for (request, response) in services {
             srv_rs.push_str(&request.to_rust_struct_with_impl(
@@ -280,8 +276,7 @@ impl MessageGenerator {
 
         fs::write(src_dir.join("msg.rs"), msg_rs)?;
         fs::write(src_dir.join("srv.rs"), srv_rs)?;
-        fs::write(msg_dir.join("rmw.rs"), rmw_stub_file("msg"))?;
-        fs::write(srv_dir.join("rmw.rs"), rmw_stub_file("srv"))?;
+        fs::write(src_dir.join("decode.rs"), decode_stub_file())?;
 
         Ok(())
     }
@@ -494,15 +489,11 @@ fn rust_type_dependency_package(rust_type: &str) -> Option<&str> {
     Some(prefix.trim_start_matches("Vec<").trim_start_matches('['))
 }
 
-fn rmw_stub_file(kind: &str) -> String {
+fn decode_stub_file() -> String {
     let mut content = String::new();
-    content.push_str(&format!(
-        "//! Placeholder trait for `{}` deserialization backend.\n",
-        kind
-    ));
     content.push_str("//! Placeholder trait for deserialization backend.\n");
     content.push_str("//!\n");
-    content.push_str("//! This file intentionally does not bind to `rosidl_runtime_rs`.\n\n");
+    content.push_str("//! This file intentionally does not bind to a concrete CDR backend yet.\n\n");
     content.push_str("pub trait CdrDeserialize: Sized {\n");
     content.push_str("    fn from_cdr(_bytes: &[u8]) -> Result<Self, String> {\n");
     content.push_str("        Err(\"deserialization backend is not implemented\".to_string())\n");
@@ -598,9 +589,8 @@ mod tests {
         assert!(single_dir.join("src/lib.rs").exists());
         assert!(single_dir.join("Cargo.toml").exists());
         assert!(single_dir.join("src/msg.rs").exists());
-        assert!(single_dir.join("src/msg/rmw.rs").exists());
         assert!(single_dir.join("src/srv.rs").exists());
-        assert!(single_dir.join("src/srv/rmw.rs").exists());
+        assert!(single_dir.join("src/decode.rs").exists());
 
         let package_manifest = fs::read_to_string(single_dir.join("Cargo.toml"))?;
         assert!(package_manifest.contains("geometry_msgs = { path = \"../geometry_msgs\" }"));
