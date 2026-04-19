@@ -1,67 +1,54 @@
-
 # ROS2 Message Generator for Rust
 
-A standalone Rust crate for generating Rust code from ROS2 `.msg` and `.srv` files.
-The generator writes one Rust crate per ROS package into the output directory, with clean
-cross-package type references such as
-`geometry_msgs::msg::Quaternion`.
+A standalone Rust crate for generating Rust code from ROS 2 `.msg` and `.srv` files.
+The generator writes one Rust crate per ROS package into the output directory, with
+clean cross-package type references such as `geometry_msgs::msg::Quaternion`.
 
+## Motivation
 
+Most existing ROS 2 message generators in Rust are tightly coupled with the DDS/RMW
+ecosystem and focus on runtime communication.
 
-### Motivation
+This project takes a different direction:
 
-Most existing ROS 2 message generators in Rust are tightly coupled with the DDS/RMW ecosystem, focusing on enabling runtime communication.
-
-This project explores a different direction:
-
-> treating ROS 2 messages as a **wire format** rather than a runtime abstraction.
+> treat ROS 2 messages as a wire format rather than a runtime abstraction.
 
 The goal is to build a lightweight Rust toolchain that can:
 
-* generate Rust structs from `.msg` definitions
-* decode ROS 2 CDR-encoded message payloads
-* work without requiring a full ROS 2 installation
+- generate Rust structs from `.msg` and `.srv` definitions
+- decode ROS 2 CDR-encoded message payloads
+- work without a ROS 2 runtime binding
 
-This is particularly motivated by use cases such as:
+This is aimed at workflows such as:
 
-* offline rosbag / MCAP processing
-* SLAM and robotics data pipelines
-* dataset conversion and analysis
+- offline rosbag / MCAP processing
+- SLAM and robotics data pipelines
+- dataset conversion and analysis
 
----
+## Current Status
 
-### Current Status
+This project is still evolving, but the current generator already supports:
 
-⚠️ This project is in an early stage.
+- parsing ROS 2 `.msg` and `.srv` files
+- generating one Rust crate per ROS package
+- generating a shared `cdr-runtime` crate
+- generating `decode.rs` with automatic `DecodeCdr` impls for all generated message types
 
-At the moment, it is focused on:
+The runtime and output layout may still change, but the current path is:
 
-* parsing `.msg` definitions
-* generating Rust struct representations
-* experimenting with a minimal CDR decoding layer
-
-Many features are incomplete or subject to change.
-
----
-
-### Design Direction (WIP)
-
-The long-term direction is to:
-
-* decouple message handling from ROS 2 runtime
-* provide deterministic, inspectable decoding
-* enable integration with non-ROS data pipelines
-
-
+- shared `cdr-runtime`
+- generated package crates with `msg.rs`, `srv.rs`, and `decode.rs`
+- explicit, inspectable decode logic instead of ROS runtime bindings
 
 ## Features
 
-- Parse ROS2 `.msg` and `.srv` files
-- Support for arrays and complex types  
+- Parse ROS 2 `.msg` and `.srv` files
+- Support primitive fields, arrays, constants, and nested types
 - Generate one crate per ROS package under the output directory
-- Cross-package type references (e.g. `geometry_msgs::msg::Quaternion`)
-- Auto-generate per-package `Cargo.toml` files and cross-package `path` dependencies
-- Placeholder `decode.rs` for future backend integration
+- Cross-package type references such as `geometry_msgs::msg::Quaternion`
+- Auto-generate per-package `Cargo.toml` files and local `path` dependencies
+- Generate a shared `cdr-runtime` crate
+- Generate `decode.rs` with automatic `DecodeCdr` implementations
 - Configurable naming conventions
 - Standalone binary tool
 - Library integration
@@ -71,13 +58,12 @@ The long-term direction is to:
 ### As a Binary Tool
 
 ```bash
-# Install from source or add to your Rust project
 cargo install /path/to/ros2-message-gen
 
-# Generate Rust code into an output directory
+# Generate Rust crates from a ROS interface tree
 ros2-message-gen -d /mnt/ubuntu/opt/ros/humble/share generated_ws
 
-# Generate from ROS environment variables
+# Generate from detected ROS environment variables
 ros2-message-gen -r generated_ws
 ```
 
@@ -87,25 +73,16 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-<!-- ros2-message-gen = "0.1.0" -->
-serde = { version = "1.0", features = ["derive"] }
-cdr-encoding = "0.10"
-byteorder = "1.5"
+ros2-message-gen = { path = "../message-gen" }
 ```
 
-Use in your code:
+Use it in your code:
 
 ```rust
-use ros2_message_gen::{MessageGenerator, StructNameStyle};
+use ros2_message_gen::MessageGenerator;
 
-// Create a generator
 let generator = MessageGenerator::new("generated_ws".to_string());
-
-// Generate from a directory containing .msg files
 generator.generate_from_directory("/mnt/ubuntu/opt/ros/humble/share")?;
-
-// Or generate from ROS environment variables
-generator.generate_from_ros_env()?;
 ```
 
 ## Generated Output Layout
@@ -114,34 +91,41 @@ The generator creates:
 
 ```text
 generated_ws/
-├── workspace-members.toml
+├── cdr-runtime
+│   ├── Cargo.toml
+│   └── src
+│       └── lib.rs
 ├── geometry_msgs
 │   ├── Cargo.toml
 │   └── src
-│       ├── lib.rs
 │       ├── decode.rs
+│       ├── lib.rs
 │       ├── msg.rs
 │       └── srv.rs
-└── sensor_msgs
-    ├── Cargo.toml
-    └── src
-        ├── lib.rs
-        ├── srv.rs
-        ├── msg.rs
-        └── decode.rs
+├── sensor_msgs
+│   ├── Cargo.toml
+│   └── src
+│       ├── decode.rs
+│       ├── lib.rs
+│       ├── msg.rs
+│       └── srv.rs
+└── workspace-members.toml
 ```
 
-`decode.rs` contains a placeholder trait for deserialization backend integration and does
-not bind to a concrete CDR backend yet.
+Notes:
 
-Each package crate gets its own `Cargo.toml`, and any referenced ROS package is added as a
-local `path` dependency.
+- `cdr-runtime` is shared by all generated package crates.
+- Each package crate gets its own `Cargo.toml`.
+- Cross-package references are emitted as normal Rust crate paths.
+- `decode.rs` is generated code, not a placeholder. It re-exports runtime items and adds
+  `impl DecodeCdr for T` for all generated message and service request/response types.
 
 The output directory itself is not generated as a Cargo workspace root. This avoids nested
-workspace conflicts when you place the generated packages inside an existing workspace.
-If the generator finds an existing parent workspace, it appends the generated package paths
-to that workspace's `members` list automatically. If no parent workspace is found, it
-writes `workspace-members.toml` with ready-to-paste member entries.
+workspace conflicts when you place generated crates inside an existing workspace.
+
+If the generator finds an existing parent workspace, it appends generated package paths to
+that workspace's `members` list automatically. If no parent workspace is found, it writes
+`workspace-members.toml` with ready-to-paste member entries.
 
 ## Generated Code Example
 
@@ -157,6 +141,22 @@ pub struct Imu {
 
     #[allow(missing_docs)]
     pub orientation_covariance: [f64; 9],
+}
+```
+
+Generated decode code is emitted separately in `decode.rs`, for example:
+
+```rust
+pub use cdr_runtime::{decode_from_bytes, CdrDecoder, DecodeCdr, Endianness, WChar16, WChar32};
+
+impl DecodeCdr for Imu {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+        Ok(Self {
+            header: <std_msgs::msg::Header as DecodeCdr>::decode_cdr(decoder)?,
+            orientation: <geometry_msgs::msg::Quaternion as DecodeCdr>::decode_cdr(decoder)?,
+            orientation_covariance: decoder.read_array::<f64, 9>()?,
+        })
+    }
 }
 ```
 
@@ -179,13 +179,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cdr-runtime = { path = "../cdr-runtime" }
 serde = { version = "1.0", features = ["derive"], optional = true }
 geometry_msgs = { path = "../geometry_msgs" }
 std_msgs = { path = "../std_msgs" }
 
 [features]
 default = []
-serde = ["dep:serde"]
+serde = ["dep:serde", "geometry_msgs/serde", "std_msgs/serde"]
 ```
 
 ### 3. Depend on It from Main Project
@@ -210,14 +211,26 @@ fn handle_imu(msg: Imu) {
 }
 ```
 
-### 5. Add Generated Packages to an Existing Workspace
+### 5. Decode a CDR Payload
 
-If `generated_interfaces/` lives inside an existing Cargo workspace, add the generated
-ROS packages to the top-level workspace `Cargo.toml`:
+```rust
+use sensor_msgs::decode::decode_from_bytes;
+use sensor_msgs::msg::Imu;
+
+fn parse_imu(bytes: &[u8]) -> Result<Imu, String> {
+    decode_from_bytes::<Imu>(bytes)
+}
+```
+
+### 6. Add Generated Packages to an Existing Workspace
+
+If `generated_interfaces/` lives inside an existing Cargo workspace, the generator will try
+to append entries like these to the top-level workspace `Cargo.toml` automatically:
 
 ```toml
 members = [
     "crates/app",
+    "generated_interfaces/cdr-runtime",
     "generated_interfaces/std_msgs",
     "generated_interfaces/geometry_msgs",
     "generated_interfaces/sensor_msgs",
@@ -225,7 +238,8 @@ members = [
 ```
 
 If no parent workspace is found automatically, the same entries are written to
-`generated_interfaces/workspace-members.toml`.
+`generated_interfaces/workspace-members.toml` as raw member lines that you can paste into
+your existing `members = [ ... ]` array.
 
 Then crates inside that workspace can depend on the generated packages normally:
 
@@ -234,51 +248,41 @@ Then crates inside that workspace can depend on the generated packages normally:
 sensor_msgs = { path = "../generated_interfaces/sensor_msgs", features = ["serde"] }
 ```
 
-## Configuration Options
-
-```rust
-use ros2_message_gen::{MessageGenerator, GeneratorConfig, StructNameStyle};
-
-let config = GeneratorConfig::new()
-    .with_struct_name_style(StructNameStyle::CamelCase)
-    .with_include_msg_suffix(true);
-
-let generator = MessageGenerator::with_config("generated_ws".to_string(), config);
-```
-
-### Struct Naming Styles
-
-- `CamelCase`: `Point`, `RobotStatus` (default)
-- `SnakeCase`: `point`, `robot_status`  
-- `PascalCase`: Same as CamelCase
-
-## Supported ROS2 Types
-
-### Primitive Types
-- `bool`, `int8`, `uint8`, `int16`, `uint16`, `int32`, `uint32`, `int64`, `uint64`
-- `float32`, `float64`, `string`, `wstring`, `byte`, `char`
+## Type Mapping Notes
 
 ### Arrays
-- Dynamic arrays: `type[]` → `Vec<type>`
-- Fixed arrays: `type[N]` → `[type; N]`
+
+- Dynamic arrays: `type[]` -> `Vec<type>`
+- Fixed arrays: `type[N]` -> `[type; N]`
 
 ### Built-in Types
-- `builtin_interfaces/Time`, `builtin_interfaces/Duration`, `std_msgs/Header`
+
+- `string` -> `std::string::String`
+- `wstring` -> `std::string::String`
+- `builtin_interfaces/Time`, `builtin_interfaces/Duration`, and `std_msgs/Header` are
+  resolved as normal cross-package message references
 - Custom message types are referenced by module paths instead of being duplicated
+
+### Constants
+
+- ROS constants are emitted as associated constants in an `impl` block
+- String constants are emitted as `&'static str`
+- Inline comments in `.msg` / `.srv` constant definitions are stripped during parsing
 
 ## Workspace Integration
 
-This crate is designed to work as part of a Rust workspace. Add it to your workspace `Cargo.toml`:
+This crate itself can live inside a normal Rust workspace:
 
 ```toml
 [workspace]
 members = [
     "your-main-crate",
-    "message-gen",  # This crate
+    "message-gen",
 ]
+resolver = "2"
 ```
 
-And use it in your main crate:
+And your main crate can use it as a generator dependency:
 
 ```toml
 [dependencies]
@@ -292,7 +296,8 @@ ros2-message-gen [OPTIONS] <output_dir>
 ```
 
 ### Arguments
-- `--dir <dir>`: Directory containing interfaces (recursively searched)
+
+- `--dir <dir>`: Directory containing interfaces; searched recursively
 - `--env <var>`: Environment variable containing ROS install prefixes
 - `--ros-env`: Auto-detect from ROS environment variables
 - `output_dir`: Target directory that will contain generated package crates
@@ -300,10 +305,10 @@ ros2-message-gen [OPTIONS] <output_dir>
 ### Examples
 
 ```bash
-# Generate from single directory
+# Generate from a single directory tree
 ros2-message-gen -d /mnt/ubuntu/opt/ros/humble/share generated_ws
 
-# Generate from detected ROS environment
+# Generate from ROS environment
 ros2-message-gen -r generated_ws
 ```
 
@@ -332,8 +337,4 @@ cargo clippy
 
 ## License
 
-MIT License - see LICENSE file for details.
-
-## Contributing
-
-Contributions are welcome! Please submit pull requests or file issues on the project repository.
+MIT

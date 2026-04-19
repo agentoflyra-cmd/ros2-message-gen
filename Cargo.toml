@@ -8,6 +8,7 @@ license = "MIT"
 authors = ["agentoflyra <agentoflyra@gmail.com>"]
 
 [dependencies]
+codegen = "0.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
 cdr-encoding = "0.10.2"

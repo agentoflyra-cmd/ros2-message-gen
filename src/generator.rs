@@ -2,8 +2,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use codegen::{Function, Scope};
+
 use super::StructNameStyle;
 use super::parser::{MessageType, parse_fields_and_constants};
+
+const CDR_RUNTIME_SOURCE: &str = include_str!("cdr.rs");
 
 /// 消息生成配置
 #[derive(Debug, Clone)]
@@ -201,10 +205,16 @@ impl MessageGenerator {
         packages.dedup();
 
         fs::create_dir_all(&root)?;
-        if !try_append_workspace_members(&root, &packages)? {
+        self.write_cdr_runtime(&root)?;
+
+        let mut workspace_members = Vec::with_capacity(packages.len() + 1);
+        workspace_members.push("cdr-runtime");
+        workspace_members.extend(packages.iter().copied());
+
+        if !try_append_workspace_members(&root, &workspace_members)? {
             fs::write(
                 root.join("workspace-members.toml"),
-                workspace_members_snippet(&root, &packages)?,
+                workspace_members_snippet(&root, &workspace_members)?,
             )?;
         }
 
@@ -274,10 +284,23 @@ impl MessageGenerator {
             srv_rs.push('\n');
         }
 
+        let decode_rs = generate_decode_module(messages, services);
         fs::write(src_dir.join("msg.rs"), msg_rs)?;
         fs::write(src_dir.join("srv.rs"), srv_rs)?;
-        fs::write(src_dir.join("decode.rs"), decode_stub_file())?;
+        fs::write(src_dir.join("decode.rs"), decode_rs)?;
 
+        Ok(())
+    }
+
+    fn write_cdr_runtime(&self, root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let runtime_dir = root.join("cdr-runtime");
+        let runtime_src_dir = runtime_dir.join("src");
+        fs::create_dir_all(&runtime_src_dir)?;
+        fs::write(
+            runtime_dir.join("Cargo.toml"),
+            "[package]\nname = \"cdr-runtime\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )?;
+        fs::write(runtime_src_dir.join("lib.rs"), CDR_RUNTIME_SOURCE)?;
         Ok(())
     }
 }
@@ -412,6 +435,7 @@ fn package_manifest(package: &str, dependencies: &[String]) -> String {
     content.push_str("version = \"0.1.0\"\n");
     content.push_str("edition = \"2024\"\n\n");
     content.push_str("[dependencies]\n");
+    content.push_str("cdr-runtime = { path = \"../cdr-runtime\" }\n");
     content.push_str("serde = { version = \"1.0\", features = [\"derive\"], optional = true }\n");
     for dep in dependencies {
         content.push_str(&format!("{dep} = {{ path = \"../{dep}\" }}\n"));
@@ -489,17 +513,95 @@ fn rust_type_dependency_package(rust_type: &str) -> Option<&str> {
     Some(prefix.trim_start_matches("Vec<").trim_start_matches('['))
 }
 
-fn decode_stub_file() -> String {
+fn generate_decode_module(
+    messages: &[&MessageType],
+    services: &[(&MessageType, &MessageType)],
+) -> String {
+    let mut scope = Scope::new();
+
+    for msg in messages {
+        add_decode_impl(&mut scope, msg);
+    }
+
+    for (request, response) in services {
+        add_decode_impl(&mut scope, request);
+        add_decode_impl(&mut scope, response);
+    }
+
     let mut content = String::new();
-    content.push_str("//! Placeholder trait for deserialization backend.\n");
-    content.push_str("//!\n");
-    content.push_str("//! This file intentionally does not bind to a concrete CDR backend yet.\n\n");
-    content.push_str("pub trait CdrDeserialize: Sized {\n");
-    content.push_str("    fn from_cdr(_bytes: &[u8]) -> Result<Self, String> {\n");
-    content.push_str("        Err(\"deserialization backend is not implemented\".to_string())\n");
-    content.push_str("    }\n");
-    content.push_str("}\n");
+    content.push_str("#[allow(unused_imports)]\n");
+    content.push_str(
+        "pub use cdr_runtime::{decode_from_bytes, CdrDecoder, DecodeCdr, Endianness, WChar16, WChar32};\n",
+    );
+    content.push_str("#[allow(unused_imports)]\n");
+    content.push_str("use crate::msg::*;\n");
+    content.push_str("#[allow(unused_imports)]\n");
+    content.push_str("use crate::srv::*;\n\n");
+    content.push_str(&scope.to_string());
     content
+}
+
+fn add_decode_impl(scope: &mut Scope, message: &MessageType) {
+    let struct_name = message.struct_name(StructNameStyle::CamelCase);
+    let imp = scope.new_impl(&struct_name);
+    imp.impl_trait("DecodeCdr");
+    let function = imp.new_fn("decode_cdr");
+    configure_decode_function(function, message);
+}
+
+fn configure_decode_function(function: &mut Function, message: &MessageType) {
+    function.arg("decoder", "&mut CdrDecoder<'_>");
+    function.ret("Result<Self, String>");
+    function.line("Ok(Self {");
+    for field in &message.fields {
+        function.line(format!(
+            "    {}: {},",
+            rust_field_name_for_decode(&field.name),
+            decode_expression(field, &message.package)
+        ));
+    }
+    function.line("})");
+}
+
+fn rust_field_name_for_decode(name: &str) -> String {
+    match name {
+        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern"
+        | "false" | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match"
+        | "mod" | "move" | "mut" | "pub" | "ref" | "return" | "self" | "Self"
+        | "static" | "struct" | "super" | "trait" | "true" | "type" | "unsafe"
+        | "use" | "where" | "while" | "async" | "await" | "dyn" | "abstract"
+        | "become" | "box" | "do" | "final" | "macro" | "override" | "priv"
+        | "typeof" | "unsized" | "virtual" | "yield" | "try" => format!("r#{}", name),
+        _ => name.to_string(),
+    }
+}
+
+fn decode_expression(field: &super::parser::Field, current_package: &str) -> String {
+    let base_type = field.rust_type(current_package);
+    if field.is_array {
+        if let Some(size) = field.array_size {
+            format!("decoder.read_array::<{}, {}>()?", strip_container_type(&base_type), size)
+        } else {
+            format!("decoder.read_seq::<{}>()?", strip_vec_type(&base_type))
+        }
+    } else {
+        format!("<{} as DecodeCdr>::decode_cdr(decoder)?", base_type)
+    }
+}
+
+fn strip_vec_type(rust_type: &str) -> &str {
+    rust_type
+        .strip_prefix("Vec<")
+        .and_then(|inner| inner.strip_suffix('>'))
+        .unwrap_or(rust_type)
+}
+
+fn strip_container_type(rust_type: &str) -> &str {
+    rust_type
+        .strip_prefix('[')
+        .and_then(|inner| inner.split(';').next())
+        .map(str::trim)
+        .unwrap_or(rust_type)
 }
 
 fn parse_srv_file(path: &Path) -> Result<(MessageType, MessageType), Box<dyn std::error::Error>> {
