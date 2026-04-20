@@ -551,7 +551,7 @@ fn add_decode_impl(scope: &mut Scope, message: &MessageType) {
 
 fn configure_decode_function(function: &mut Function, message: &MessageType) {
     function.arg("decoder", "&mut CdrDecoder<'_>");
-    function.ret("Result<Self, String>");
+    function.ret("Result<Self, std::string::String>");
     function.line("Ok(Self {");
     for field in &message.fields {
         function.line(format!(
@@ -885,8 +885,10 @@ mod tests {
         generator.generate_from_directory(temp_dir.path().to_str().ok_or("invalid temp dir")?)?;
 
         let msg_content = fs::read_to_string(output_dir.join("std_msgs/src/msg.rs"))?;
+        let decode_content = fs::read_to_string(output_dir.join("std_msgs/src/decode.rs"))?;
         assert!(msg_content.contains("pub struct String"));
         assert!(msg_content.contains("pub data: std::string::String,"));
+        assert!(decode_content.contains("Result<Self, std::string::String>"));
 
         Ok(())
     }
