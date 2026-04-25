@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use codegen::{Function, Scope};
+use codegen::{Function, Impl, Scope};
+
+use crate::parser;
 
 use super::StructNameStyle;
 use super::parser::{MessageType, parse_fields_and_constants};
@@ -41,6 +43,68 @@ impl GeneratorConfig {
         self.include_msg_suffix = include;
         self
     }
+}
+
+pub fn generate_msg_module(messages: &[&MessageType]) -> String {
+    let mut scope = Scope::new();
+    for message in messages {
+        add_message_struct(&mut scope, message);
+    }
+    scope.to_string()
+}
+
+fn add_message_struct(scope: &mut Scope, message: &MessageType) {
+    let struct_name = message.struct_name(StructNameStyle::CamelCase);
+    let s = scope.new_struct(&struct_name);
+
+    s.vis("pub");
+    s.attr(r#"cfg_attr(feature = "serde", derive(Deserialize, Serialize))"#);
+    s.derive("Clone");
+    s.derive("Debug");
+    s.derive("PartialEq");
+    s.derive("PartialOrd");
+
+    for field in &message.fields {
+        let f = s.new_field(
+            rust_field_name_for_decode(&field.name),
+            field.rust_type(&message.package),
+        );
+        f.vis("pub");
+        f.annotation("#[allow(missing_docs)]");
+    }
+
+    add_message_content(scope, message);
+}
+
+fn add_message_content(scope: &mut Scope, message: &MessageType) {
+    if message.constants.is_empty() {
+        return;
+    }
+
+    let struct_name = message.struct_name(StructNameStyle::CamelCase);
+    let imp = scope.new_impl(&struct_name);
+    add_consts_to_impl(imp, &message.constants);
+}
+
+fn add_consts_to_impl(imp: &mut Impl, consts: &[parser::Constant]) {
+    for constant in consts {
+        let ty = constant.const_type.as_str();
+        let name = constant.name.as_str();
+        let value = constant.value.as_str();
+        imp.associate_const(name, ty, value, "pub");
+    }
+}
+
+fn generate_srv_module(services: &[(&MessageType, &MessageType)]) -> String {
+    let mut scope = Scope::new();
+
+    for (request, response) in services {
+        add_message_struct(&mut scope, request);
+        add_message_content(&mut scope, request);
+        add_message_struct(&mut scope, response);
+        add_message_content(&mut scope, response);
+    }
+    scope.to_string()
 }
 
 /// 消息生成器
@@ -257,13 +321,14 @@ impl MessageGenerator {
         msg_rs.push_str("#[cfg(feature = \"serde\")]\n");
         msg_rs.push_str("use serde::{Deserialize, Serialize};\n\n");
 
-        for msg in messages {
-            msg_rs.push_str(&msg.to_rust_struct_with_impl(
-                self.config.struct_name_style,
-                self.config.include_msg_suffix,
-            ));
-            msg_rs.push('\n');
-        }
+        // for msg in messages {
+        //     msg_rs.push_str(&msg.to_rust_struct_with_impl(
+        //         self.config.struct_name_style,
+        //         self.config.include_msg_suffix,
+        //     ));
+        //     msg_rs.push('\n');
+        // }
+        msg_rs.push_str(generate_msg_module(messages).as_str());
 
         let mut srv_rs = String::new();
         srv_rs.push_str("#![allow(unused_imports)]\n");
@@ -271,18 +336,19 @@ impl MessageGenerator {
         srv_rs.push_str("use serde::{Deserialize, Serialize};\n");
         srv_rs.push_str("use crate::msg::*;\n\n");
 
-        for (request, response) in services {
-            srv_rs.push_str(&request.to_rust_struct_with_impl(
-                self.config.struct_name_style,
-                self.config.include_msg_suffix,
-            ));
-            srv_rs.push('\n');
-            srv_rs.push_str(&response.to_rust_struct_with_impl(
-                self.config.struct_name_style,
-                self.config.include_msg_suffix,
-            ));
-            srv_rs.push('\n');
-        }
+        // for (request, response) in services {
+        //     srv_rs.push_str(&request.to_rust_struct_with_impl(
+        //         self.config.struct_name_style,
+        //         self.config.include_msg_suffix,
+        //     ));
+        //     srv_rs.push('\n');
+        //     srv_rs.push_str(&response.to_rust_struct_with_impl(
+        //         self.config.struct_name_style,
+        //         self.config.include_msg_suffix,
+        //     ));
+        //     srv_rs.push('\n');
+        // }
+        srv_rs.push_str(generate_srv_module(services).as_str());
 
         let decode_rs = generate_decode_module(messages, services);
         fs::write(src_dir.join("msg.rs"), msg_rs)?;
@@ -565,13 +631,12 @@ fn configure_decode_function(function: &mut Function, message: &MessageType) {
 
 fn rust_field_name_for_decode(name: &str) -> String {
     match name {
-        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern"
-        | "false" | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match"
-        | "mod" | "move" | "mut" | "pub" | "ref" | "return" | "self" | "Self"
-        | "static" | "struct" | "super" | "trait" | "true" | "type" | "unsafe"
-        | "use" | "where" | "while" | "async" | "await" | "dyn" | "abstract"
-        | "become" | "box" | "do" | "final" | "macro" | "override" | "priv"
-        | "typeof" | "unsized" | "virtual" | "yield" | "try" => format!("r#{}", name),
+        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" | "false"
+        | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move"
+        | "mut" | "pub" | "ref" | "return" | "self" | "Self" | "static" | "struct" | "super"
+        | "trait" | "true" | "type" | "unsafe" | "use" | "where" | "while" | "async" | "await"
+        | "dyn" | "abstract" | "become" | "box" | "do" | "final" | "macro" | "override"
+        | "priv" | "typeof" | "unsized" | "virtual" | "yield" | "try" => format!("r#{}", name),
         _ => name.to_string(),
     }
 }
@@ -580,7 +645,11 @@ fn decode_expression(field: &super::parser::Field, current_package: &str) -> Str
     let base_type = field.rust_type(current_package);
     if field.is_array {
         if let Some(size) = field.array_size {
-            format!("decoder.read_array::<{}, {}>()?", strip_container_type(&base_type), size)
+            format!(
+                "decoder.read_array::<{}, {}>()?",
+                strip_container_type(&base_type),
+                size
+            )
         } else {
             format!("decoder.read_seq::<{}>()?", strip_vec_type(&base_type))
         }

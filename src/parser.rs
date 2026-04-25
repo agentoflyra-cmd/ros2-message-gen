@@ -1,3 +1,4 @@
+use codegen::Scope;
 use std::fs;
 use std::path::Path;
 
@@ -187,25 +188,6 @@ impl Field {
             _ => ros_type.to_string(),
         }
     }
-
-    #[allow(dead_code)]
-    fn snake_to_camel(&self, snake_str: &str) -> String {
-        let mut camel_case = String::new();
-        let mut capitalize_next = true;
-
-        for ch in snake_str.chars() {
-            if ch == '_' {
-                capitalize_next = true;
-            } else if capitalize_next {
-                camel_case.push(ch.to_uppercase().next().unwrap());
-                capitalize_next = false;
-            } else {
-                camel_case.push(ch);
-            }
-        }
-
-        camel_case
-    }
 }
 
 impl MessageType {
@@ -270,144 +252,6 @@ impl MessageType {
 
         camel_case
     }
-
-    /// 生成完整的 Rust 结构体代码
-    ///
-    /// # 配置参数
-    ///
-    /// - `struct_name_style`: 控制 struct 命名风格 (CamelCase 或 SnakeCase)
-    /// - `include_msg_suffix`: 是否在消息类型名称中包含 /msg/ 中缀
-    ///
-    /// # 示例输出
-    ///
-    /// ```ignore
-    /// use serde::{Deserialize, Serialize};
-    ///
-    /// #[derive(Debug, Clone, Serialize, Deserialize)]
-    /// pub struct Point {
-    ///     pub x: f64,
-    ///     pub y: f64,
-    ///     pub z: f64,
-    /// }
-    ///
-    /// ```
-    pub fn to_rust_struct_with_impl(
-        &self,
-        struct_name_style: StructNameStyle,
-        include_msg_suffix: bool,
-    ) -> String {
-        let struct_name = self.struct_name(struct_name_style);
-        let mut output = String::new();
-
-        // 生成结构体
-        output.push_str("#[cfg_attr(feature = \"serde\", derive(Deserialize, Serialize))]\n");
-        output.push_str("#[derive(Clone, Debug, PartialEq, PartialOrd)]\n");
-        output.push_str(&format!("pub struct {} {{\n", struct_name));
-
-        for field in &self.fields {
-            let field_name = rust_identifier(&field.name);
-            output.push_str("    #[allow(missing_docs)]\n");
-            output.push_str(&format!(
-                "    pub {}: {},\n\n",
-                field_name,
-                field.rust_type(&self.package)
-            ));
-        }
-
-        output.push_str("}\n\n");
-
-        // 生成常量定义
-        if !self.constants.is_empty() {
-            output.push_str(&format!("impl {} {{\n", struct_name));
-            for constant in &self.constants {
-                // 解析常量值和类型
-                let (const_value, const_type) =
-                    self.parse_constant_value(&constant.value, &constant.const_type);
-                output.push_str(&format!(
-                    "    pub const {}: {} = {};\n",
-                    constant.name, const_type, const_value
-                ));
-            }
-            output.push_str("}\n\n");
-        }
-
-        let _ = include_msg_suffix;
-
-        output
-    }
-
-    /// 解析常量值并推断类型
-    fn parse_constant_value(&self, value_str: &str, declared_type: &str) -> (String, String) {
-        if declared_type == "String" || declared_type == "std::string::String" {
-            return (
-                format!("\"{}\"", escape_rust_string(value_str)),
-                "&'static str".to_string(),
-            );
-        }
-
-        if !declared_type.is_empty() {
-            return (value_str.to_string(), declared_type.to_string());
-        }
-
-        // 尝试解析为不同类型
-        if let Ok(int_val) = value_str.parse::<i64>() {
-            // 根据值大小选择合适的类型
-            if int_val >= i8::MIN as i64 && int_val <= i8::MAX as i64 {
-                (int_val.to_string(), "i8".to_string())
-            } else if int_val >= i16::MIN as i64 && int_val <= i16::MAX as i64 {
-                (int_val.to_string(), "i16".to_string())
-            } else if int_val >= i32::MIN as i64 && int_val <= i32::MAX as i64 {
-                (int_val.to_string(), "i32".to_string())
-            } else {
-                (int_val.to_string(), "i64".to_string())
-            }
-        } else if let Ok(uint_val) = value_str.parse::<u64>() {
-            // 无符号整数
-            if uint_val <= u8::MAX as u64 {
-                (uint_val.to_string(), "u8".to_string())
-            } else if uint_val <= u16::MAX as u64 {
-                (uint_val.to_string(), "u16".to_string())
-            } else if uint_val <= u32::MAX as u64 {
-                (uint_val.to_string(), "u32".to_string())
-            } else {
-                (uint_val.to_string(), "u64".to_string())
-            }
-        } else if let Ok(float_val) = value_str.parse::<f64>() {
-            // 浮点数
-            if float_val >= f32::MIN as f64 && float_val <= f32::MAX as f64 {
-                (float_val.to_string(), "f32".to_string())
-            } else {
-                (float_val.to_string(), "f64".to_string())
-            }
-        } else {
-            // 字符串或其他类型，默认为字符串
-            (format!("\"{}\"", value_str), "String".to_string())
-        }
-    }
-
-    /// 生成仅包含结构体的代码（不含宏调用）
-    pub fn to_rust_struct(&self, style: StructNameStyle) -> String {
-        let struct_name = self.struct_name(style);
-        let mut output = String::new();
-
-        output.push_str("#[cfg_attr(feature = \"serde\", derive(Deserialize, Serialize))]\n");
-        output.push_str("#[derive(Clone, Debug, PartialEq, PartialOrd)]\n");
-        output.push_str(&format!("pub struct {} {{\n", struct_name));
-
-        for field in &self.fields {
-            let field_name = rust_identifier(&field.name);
-            output.push_str("    #[allow(missing_docs)]\n");
-            output.push_str(&format!(
-                "    pub {}: {},\n\n",
-                field_name,
-                field.rust_type(&self.package)
-            ));
-        }
-
-        output.push_str("}\n\n");
-
-        output
-    }
 }
 
 pub(crate) fn parse_fields_and_constants(
@@ -470,80 +314,6 @@ pub(crate) fn parse_fields_and_constants(
     (fields, constants)
 }
 
-fn escape_rust_string(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
-
-fn rust_identifier(name: &str) -> &str {
-    match name {
-        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" | "false"
-        | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move"
-        | "mut" | "pub" | "ref" | "return" | "self" | "Self" | "static" | "struct" | "super"
-        | "trait" | "true" | "type" | "unsafe" | "use" | "where" | "while" | "async" | "await"
-        | "dyn" | "abstract" | "become" | "box" | "do" | "final" | "macro" | "override"
-        | "priv" | "typeof" | "unsized" | "virtual" | "yield" | "try" => match name {
-            "as" => "r#as",
-            "break" => "r#break",
-            "const" => "r#const",
-            "continue" => "r#continue",
-            "crate" => "r#crate",
-            "else" => "r#else",
-            "enum" => "r#enum",
-            "extern" => "r#extern",
-            "false" => "r#false",
-            "fn" => "r#fn",
-            "for" => "r#for",
-            "if" => "r#if",
-            "impl" => "r#impl",
-            "in" => "r#in",
-            "let" => "r#let",
-            "loop" => "r#loop",
-            "match" => "r#match",
-            "mod" => "r#mod",
-            "move" => "r#move",
-            "mut" => "r#mut",
-            "pub" => "r#pub",
-            "ref" => "r#ref",
-            "return" => "r#return",
-            "self" => "r#self",
-            "Self" => "r#Self",
-            "static" => "r#static",
-            "struct" => "r#struct",
-            "super" => "r#super",
-            "trait" => "r#trait",
-            "true" => "r#true",
-            "type" => "r#type",
-            "unsafe" => "r#unsafe",
-            "use" => "r#use",
-            "where" => "r#where",
-            "while" => "r#while",
-            "async" => "r#async",
-            "await" => "r#await",
-            "dyn" => "r#dyn",
-            "abstract" => "r#abstract",
-            "become" => "r#become",
-            "box" => "r#box",
-            "do" => "r#do",
-            "final" => "r#final",
-            "macro" => "r#macro",
-            "override" => "r#override",
-            "priv" => "r#priv",
-            "typeof" => "r#typeof",
-            "unsized" => "r#unsized",
-            "virtual" => "r#virtual",
-            "yield" => "r#yield",
-            "try" => "r#try",
-            _ => name,
-        },
-        _ => name,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,26 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn test_constant_parsing_uses_declared_type() {
-        let content = "uint64 DEPTH_RECURSIVE=1\nstring[] prefixes\nuint64 depth";
-        let path = std::path::Path::new("/tmp/rcl_interfaces/msg/ListParameters_Request.msg");
-        let msg_type = MessageType::from_content(path, content).unwrap();
-
-        assert_eq!(msg_type.name, "ListParameters_Request");
-        assert_eq!(msg_type.constants.len(), 1);
-        assert_eq!(msg_type.constants[0].name, "DEPTH_RECURSIVE");
-        assert_eq!(msg_type.constants[0].const_type, "u64");
-        assert_eq!(msg_type.fields.len(), 2);
-        assert_eq!(msg_type.fields[0].name, "prefixes");
-        assert_eq!(msg_type.fields[1].name, "depth");
-
-        let generated = msg_type.to_rust_struct_with_impl(StructNameStyle::CamelCase, true);
-        assert!(generated.contains("pub struct ListParametersRequest"));
-        assert!(generated.contains("pub const DEPTH_RECURSIVE: u64 = 1;"));
-        assert!(!generated.contains("pub DEPTH_RECURSIVE: u64,"));
-    }
-
-    #[test]
     fn test_request_response_suffixes_are_preserved() {
         let req_path = std::path::Path::new("/tmp/example_interfaces/msg/AddTwoInts_Request.msg");
         let resp_path = std::path::Path::new("/tmp/example_interfaces/msg/AddTwoInts_Response.msg");
@@ -616,46 +366,5 @@ mod tests {
             resp.struct_name(StructNameStyle::CamelCase),
             "AddTwoIntsResponse"
         );
-    }
-
-    #[test]
-    fn test_constant_parsing_accepts_spaced_equals() {
-        let content = "uint8 PENDING = 0\nuint8 ACTIVE = 1\nstring text";
-        let path = std::path::Path::new("/tmp/actionlib_msgs/msg/GoalStatus.msg");
-        let msg_type = MessageType::from_content(path, content).unwrap();
-
-        assert_eq!(msg_type.constants.len(), 2);
-        assert_eq!(msg_type.fields.len(), 1);
-
-        let generated = msg_type.to_rust_struct_with_impl(StructNameStyle::CamelCase, true);
-        assert!(generated.contains("pub const PENDING: u8 = 0;"));
-        assert!(generated.contains("pub const ACTIVE: u8 = 1;"));
-        assert!(!generated.contains("pub PENDING: u8,"));
-        assert!(!generated.contains("pub ACTIVE: u8,"));
-    }
-
-    #[test]
-    fn test_string_constants_are_quoted() {
-        let content = "string DISABLE_HEARTBEAT_TIMEOUT_PARAM=/bond_disable_heartbeat_timeout";
-        let path = std::path::Path::new("/tmp/bond/msg/Constants.msg");
-        let msg_type = MessageType::from_content(path, content).unwrap();
-
-        let generated = msg_type.to_rust_struct_with_impl(StructNameStyle::CamelCase, true);
-        assert!(
-            generated.contains(
-                "pub const DISABLE_HEARTBEAT_TIMEOUT_PARAM: &'static str = \"/bond_disable_heartbeat_timeout\";"
-            )
-        );
-    }
-
-    #[test]
-    fn test_rust_keywords_are_escaped_in_field_names() {
-        let content = "uint8 fn\nstring type";
-        let path = std::path::Path::new("/tmp/unitree_hg/msg/BmsState.msg");
-        let msg_type = MessageType::from_content(path, content).unwrap();
-
-        let generated = msg_type.to_rust_struct_with_impl(StructNameStyle::CamelCase, true);
-        assert!(generated.contains("pub r#fn: u8,"));
-        assert!(generated.contains("pub r#type: std::string::String,"));
     }
 }
