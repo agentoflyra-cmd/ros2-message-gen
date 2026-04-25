@@ -1,4 +1,3 @@
-use codegen::Scope;
 use std::fs;
 use std::path::Path;
 
@@ -226,15 +225,6 @@ impl MessageType {
         }
     }
 
-    /// 获取完整的 ROS 消息类型名称 (例如 "geometry_msgs/msg/Point")
-    pub fn message_type_name(&self, include_msg_suffix: bool) -> String {
-        if include_msg_suffix {
-            format!("{}/msg/{}", self.package, self.name)
-        } else {
-            format!("{}/{}", self.package, self.name)
-        }
-    }
-
     fn snake_to_camel(&self, snake_str: &str) -> String {
         let mut camel_case = String::new();
         let mut capitalize_next = true;
@@ -286,7 +276,7 @@ pub(crate) fn parse_fields_and_constants(
             if left_parts.len() >= 2 {
                 let field_type = left_parts[0];
                 let name_part = left_parts[1];
-                let is_constant_name = name_part.chars().next().map_or(false, |c| c.is_uppercase())
+                let is_constant_name = name_part.chars().next().is_none_or(|c| c.is_uppercase())
                     && !name_part.contains('[')
                     && !name_part.contains(']')
                     && !name_part.chars().any(|c| c.is_lowercase() && c != '_');

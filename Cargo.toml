@@ -10,10 +10,6 @@ authors = ["agentoflyra <agentoflyra@gmail.com>"]
 [dependencies]
 codegen = "0.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
-thiserror = "2.0.17"
-cdr-encoding = "0.10.2"
-cdr-encoding-size = "0.5.1"
-byteorder = "1.5.0"
 tempfile = "3.10"
 
 [dev-dependencies]

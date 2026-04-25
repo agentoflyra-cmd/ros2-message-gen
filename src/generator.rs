@@ -4,27 +4,30 @@ use std::path::{Path, PathBuf};
 
 use codegen::{Function, Impl, Scope};
 
-use crate::parser;
-
 use super::StructNameStyle;
-use super::parser::{MessageType, parse_fields_and_constants};
+use super::parser::{Constant, MessageType, parse_fields_and_constants};
 
 const CDR_RUNTIME_SOURCE: &str = include_str!("cdr.rs");
+const DISPATCH_CRATE_NAME: &str = "ros2-dispatch";
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+    "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+    "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
+    "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+];
 
 /// 消息生成配置
 #[derive(Debug, Clone)]
 pub struct GeneratorConfig {
     /// struct 命名风格
     pub struct_name_style: StructNameStyle,
-    /// 是否在消息类型名称中包含 /msg/ 中缀（当前仅保留兼容）
-    pub include_msg_suffix: bool,
 }
 
 impl Default for GeneratorConfig {
     fn default() -> Self {
         Self {
             struct_name_style: StructNameStyle::CamelCase,
-            include_msg_suffix: true,
         }
     }
 }
@@ -38,23 +41,18 @@ impl GeneratorConfig {
         self.struct_name_style = style;
         self
     }
-
-    pub fn with_include_msg_suffix(mut self, include: bool) -> Self {
-        self.include_msg_suffix = include;
-        self
-    }
 }
 
-pub fn generate_msg_module(messages: &[&MessageType]) -> String {
+pub fn generate_msg_module(messages: &[&MessageType], style: StructNameStyle) -> String {
     let mut scope = Scope::new();
     for message in messages {
-        add_message_struct(&mut scope, message);
+        add_message_struct(&mut scope, message, style);
     }
     scope.to_string()
 }
 
-fn add_message_struct(scope: &mut Scope, message: &MessageType) {
-    let struct_name = message.struct_name(StructNameStyle::CamelCase);
+fn add_message_struct(scope: &mut Scope, message: &MessageType, style: StructNameStyle) {
+    let struct_name = message.struct_name(style);
     let s = scope.new_struct(&struct_name);
 
     s.vis("pub");
@@ -66,43 +64,61 @@ fn add_message_struct(scope: &mut Scope, message: &MessageType) {
 
     for field in &message.fields {
         let f = s.new_field(
-            rust_field_name_for_decode(&field.name),
+            rust_identifier(&field.name),
             field.rust_type(&message.package),
         );
         f.vis("pub");
         f.annotation("#[allow(missing_docs)]");
     }
 
-    add_message_content(scope, message);
+    add_message_content(scope, message, style);
 }
 
-fn add_message_content(scope: &mut Scope, message: &MessageType) {
+fn add_message_content(scope: &mut Scope, message: &MessageType, style: StructNameStyle) {
     if message.constants.is_empty() {
         return;
     }
 
-    let struct_name = message.struct_name(StructNameStyle::CamelCase);
+    let struct_name = message.struct_name(style);
     let imp = scope.new_impl(&struct_name);
     add_consts_to_impl(imp, &message.constants);
 }
 
-fn add_consts_to_impl(imp: &mut Impl, consts: &[parser::Constant]) {
+fn add_consts_to_impl(imp: &mut Impl, consts: &[Constant]) {
     for constant in consts {
-        let ty = constant.const_type.as_str();
+        let (ty, value) = format_constant(constant);
         let name = constant.name.as_str();
-        let value = constant.value.as_str();
         imp.associate_const(name, ty, value, "pub");
     }
 }
 
-fn generate_srv_module(services: &[(&MessageType, &MessageType)]) -> String {
+fn format_constant(constant: &Constant) -> (&str, String) {
+    let ty = constant.const_type.as_str();
+    if ty == "std::string::String" {
+        ("&'static str", format!("\"{}\"", escape_rust_string(&constant.value)))
+    } else {
+        (ty, constant.value.clone())
+    }
+}
+
+fn escape_rust_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn generate_srv_module(
+    services: &[(&MessageType, &MessageType)],
+    style: StructNameStyle,
+) -> String {
     let mut scope = Scope::new();
 
     for (request, response) in services {
-        add_message_struct(&mut scope, request);
-        add_message_content(&mut scope, request);
-        add_message_struct(&mut scope, response);
-        add_message_content(&mut scope, response);
+        add_message_struct(&mut scope, request, style);
+        add_message_struct(&mut scope, response, style);
     }
     scope.to_string()
 }
@@ -142,11 +158,6 @@ impl MessageGenerator {
 
     pub fn with_struct_name_style(mut self, style: StructNameStyle) -> Self {
         self.config.struct_name_style = style;
-        self
-    }
-
-    pub fn with_include_msg_suffix(mut self, include: bool) -> Self {
-        self.config.include_msg_suffix = include;
         self
     }
 
@@ -271,9 +282,10 @@ impl MessageGenerator {
         fs::create_dir_all(&root)?;
         self.write_cdr_runtime(&root)?;
 
-        let mut workspace_members = Vec::with_capacity(packages.len() + 1);
+        let mut workspace_members = Vec::with_capacity(packages.len() + 2);
         workspace_members.push("cdr-runtime");
         workspace_members.extend(packages.iter().copied());
+        workspace_members.push(DISPATCH_CRATE_NAME);
 
         if !try_append_workspace_members(&root, &workspace_members)? {
             fs::write(
@@ -288,6 +300,8 @@ impl MessageGenerator {
             let pkg_services = services_by_pkg.get(package).cloned().unwrap_or_default();
             self.write_layout_for_package(&crate_dir, &pkg_messages, &pkg_services)?;
         }
+
+        self.write_dispatch_crate(&root, messages, services)?;
 
         Ok(())
     }
@@ -321,14 +335,7 @@ impl MessageGenerator {
         msg_rs.push_str("#[cfg(feature = \"serde\")]\n");
         msg_rs.push_str("use serde::{Deserialize, Serialize};\n\n");
 
-        // for msg in messages {
-        //     msg_rs.push_str(&msg.to_rust_struct_with_impl(
-        //         self.config.struct_name_style,
-        //         self.config.include_msg_suffix,
-        //     ));
-        //     msg_rs.push('\n');
-        // }
-        msg_rs.push_str(generate_msg_module(messages).as_str());
+        msg_rs.push_str(generate_msg_module(messages, self.config.struct_name_style).as_str());
 
         let mut srv_rs = String::new();
         srv_rs.push_str("#![allow(unused_imports)]\n");
@@ -336,21 +343,9 @@ impl MessageGenerator {
         srv_rs.push_str("use serde::{Deserialize, Serialize};\n");
         srv_rs.push_str("use crate::msg::*;\n\n");
 
-        // for (request, response) in services {
-        //     srv_rs.push_str(&request.to_rust_struct_with_impl(
-        //         self.config.struct_name_style,
-        //         self.config.include_msg_suffix,
-        //     ));
-        //     srv_rs.push('\n');
-        //     srv_rs.push_str(&response.to_rust_struct_with_impl(
-        //         self.config.struct_name_style,
-        //         self.config.include_msg_suffix,
-        //     ));
-        //     srv_rs.push('\n');
-        // }
-        srv_rs.push_str(generate_srv_module(services).as_str());
+        srv_rs.push_str(generate_srv_module(services, self.config.struct_name_style).as_str());
 
-        let decode_rs = generate_decode_module(messages, services);
+        let decode_rs = generate_decode_module(messages, services, self.config.struct_name_style);
         fs::write(src_dir.join("msg.rs"), msg_rs)?;
         fs::write(src_dir.join("srv.rs"), srv_rs)?;
         fs::write(src_dir.join("decode.rs"), decode_rs)?;
@@ -367,6 +362,36 @@ impl MessageGenerator {
             "[package]\nname = \"cdr-runtime\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
         )?;
         fs::write(runtime_src_dir.join("lib.rs"), CDR_RUNTIME_SOURCE)?;
+        Ok(())
+    }
+
+    fn write_dispatch_crate(
+        &self,
+        root: &Path,
+        messages: &[MessageType],
+        services: &[(MessageType, MessageType)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dispatch_dir = root.join(DISPATCH_CRATE_NAME);
+        let src_dir = dispatch_dir.join("src");
+        fs::create_dir_all(&src_dir)?;
+
+        let mut package_names: Vec<&str> = messages.iter().map(|msg| msg.package.as_str()).collect();
+        for (request, response) in services {
+            package_names.push(request.package.as_str());
+            package_names.push(response.package.as_str());
+        }
+        package_names.sort_unstable();
+        package_names.dedup();
+
+        fs::write(
+            dispatch_dir.join("Cargo.toml"),
+            dispatch_manifest(&package_names),
+        )?;
+        fs::write(
+            src_dir.join("lib.rs"),
+            generate_dispatch_module(messages, services, self.config.struct_name_style),
+        )?;
+
         Ok(())
     }
 }
@@ -516,6 +541,19 @@ fn package_manifest(package: &str, dependencies: &[String]) -> String {
     content
 }
 
+fn dispatch_manifest(packages: &[&str]) -> String {
+    let mut content = String::new();
+    content.push_str("[package]\n");
+    content.push_str(&format!("name = \"{}\"\n", DISPATCH_CRATE_NAME));
+    content.push_str("version = \"0.1.0\"\n");
+    content.push_str("edition = \"2024\"\n\n");
+    content.push_str("[dependencies]\n");
+    for package in packages {
+        content.push_str(&format!("{package} = {{ path = \"../{package}\" }}\n"));
+    }
+    content
+}
+
 fn package_dependencies(
     current_package: &str,
     messages: &[&MessageType],
@@ -582,16 +620,17 @@ fn rust_type_dependency_package(rust_type: &str) -> Option<&str> {
 fn generate_decode_module(
     messages: &[&MessageType],
     services: &[(&MessageType, &MessageType)],
+    style: StructNameStyle,
 ) -> String {
     let mut scope = Scope::new();
 
     for msg in messages {
-        add_decode_impl(&mut scope, msg);
+        add_decode_impl(&mut scope, msg, style);
     }
 
     for (request, response) in services {
-        add_decode_impl(&mut scope, request);
-        add_decode_impl(&mut scope, response);
+        add_decode_impl(&mut scope, request, style);
+        add_decode_impl(&mut scope, response, style);
     }
 
     let mut content = String::new();
@@ -607,8 +646,153 @@ fn generate_decode_module(
     content
 }
 
-fn add_decode_impl(scope: &mut Scope, message: &MessageType) {
-    let struct_name = message.struct_name(StructNameStyle::CamelCase);
+fn generate_dispatch_module(
+    messages: &[MessageType],
+    services: &[(MessageType, MessageType)],
+    style: StructNameStyle,
+) -> String {
+    let mut entries = dispatch_entries(messages, services, style);
+    entries.sort_by(|a, b| a.schema_name.cmp(&b.schema_name));
+
+    let mut content = String::new();
+
+    if entries.is_empty() {
+        content.push_str("pub enum DecodedMessage {}\n\n");
+        content.push_str("pub fn decode_message_by_schema(schema_name: &str, _data: &[u8]) -> Result<DecodedMessage, std::string::String> {\n");
+        content.push_str("    Err(format!(\"unknown schema: {schema_name}\"))\n");
+        content.push_str("}\n");
+        return content;
+    }
+
+    content.push_str("#[derive(Clone, Debug)]\n");
+    content.push_str("pub enum DecodedMessage {\n");
+    for entry in &entries {
+        content.push_str(&format!(
+            "    {}({}),\n",
+            entry.variant_name,
+            entry.type_path
+        ));
+    }
+    content.push_str("}\n\n");
+
+    content.push_str("impl DecodedMessage {\n");
+    content.push_str("    pub fn schema_name(&self) -> &'static str {\n");
+    content.push_str("        match self {\n");
+    for entry in &entries {
+        content.push_str(&format!(
+            "            Self::{}(_) => \"{}\",\n",
+            entry.variant_name,
+            entry.schema_name
+        ));
+    }
+    content.push_str("        }\n");
+    content.push_str("    }\n");
+    content.push_str("}\n\n");
+
+    content.push_str(
+        "pub fn decode_message_by_schema(schema_name: &str, data: &[u8]) -> Result<DecodedMessage, std::string::String> {\n",
+    );
+    content.push_str("    match schema_name {\n");
+    for entry in &entries {
+        content.push_str(&format!(
+            "        \"{schema}\" => Ok(DecodedMessage::{variant}({decode_fn}::<{ty}>(data)?)),\n",
+            schema = entry.schema_name,
+            variant = entry.variant_name,
+            decode_fn = entry.decode_fn_path,
+            ty = entry.type_path,
+        ));
+    }
+    content.push_str("        _ => Err(format!(\"unknown schema: {schema_name}\")),\n");
+    content.push_str("    }\n");
+    content.push_str("}\n");
+
+    content
+}
+
+#[derive(Clone)]
+struct DispatchEntry {
+    variant_name: String,
+    schema_name: String,
+    type_path: String,
+    decode_fn_path: String,
+}
+
+fn dispatch_entries(
+    messages: &[MessageType],
+    services: &[(MessageType, MessageType)],
+    style: StructNameStyle,
+) -> Vec<DispatchEntry> {
+    let mut entries = Vec::new();
+
+    for message in messages {
+        entries.push(DispatchEntry {
+            variant_name: dispatch_variant_name(message),
+            schema_name: dispatch_message_schema_name(message),
+            type_path: dispatch_msg_type_path(message, style),
+            decode_fn_path: dispatch_decode_fn_path(message),
+        });
+    }
+
+    for (request, response) in services {
+        entries.push(DispatchEntry {
+            variant_name: dispatch_variant_name(request),
+            schema_name: dispatch_service_schema_name(request, "Request"),
+            type_path: dispatch_srv_type_path(request, style),
+            decode_fn_path: dispatch_decode_fn_path(request),
+        });
+        entries.push(DispatchEntry {
+            variant_name: dispatch_variant_name(response),
+            schema_name: dispatch_service_schema_name(response, "Response"),
+            type_path: dispatch_srv_type_path(response, style),
+            decode_fn_path: dispatch_decode_fn_path(response),
+        });
+    }
+
+    entries
+}
+
+fn dispatch_variant_name(message: &MessageType) -> String {
+    format!(
+        "{}{}",
+        snake_to_camel(&message.package),
+        message.struct_name(StructNameStyle::CamelCase)
+    )
+}
+
+fn dispatch_message_schema_name(message: &MessageType) -> String {
+    format!("{}/msg/{}", message.package, message.name)
+}
+
+fn dispatch_service_schema_name(message: &MessageType, suffix: &str) -> String {
+    let service_name = message
+        .name
+        .strip_suffix(suffix)
+        .expect("service request/response name should have known suffix");
+    format!("{}/srv/{}_{}", message.package, service_name, suffix)
+}
+
+fn dispatch_msg_type_path(message: &MessageType, style: StructNameStyle) -> String {
+    format!(
+        "{}::msg::{}",
+        message.package,
+        message.struct_name(style)
+    )
+}
+
+fn dispatch_srv_type_path(message: &MessageType, style: StructNameStyle) -> String {
+    format!(
+        "{}::srv::{}",
+        message.package,
+        message.struct_name(style)
+    )
+}
+
+fn dispatch_decode_fn_path(message: &MessageType) -> String {
+    format!("{}::decode::decode_from_bytes", message.package)
+}
+
+fn add_decode_impl(scope: &mut Scope, message: &MessageType, style: StructNameStyle) {
+    let struct_name = message.struct_name(style);
     let imp = scope.new_impl(&struct_name);
     imp.impl_trait("DecodeCdr");
     let function = imp.new_fn("decode_cdr");
@@ -622,23 +806,37 @@ fn configure_decode_function(function: &mut Function, message: &MessageType) {
     for field in &message.fields {
         function.line(format!(
             "    {}: {},",
-            rust_field_name_for_decode(&field.name),
+            rust_identifier(&field.name),
             decode_expression(field, &message.package)
         ));
     }
     function.line("})");
 }
 
-fn rust_field_name_for_decode(name: &str) -> String {
-    match name {
-        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" | "false"
-        | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move"
-        | "mut" | "pub" | "ref" | "return" | "self" | "Self" | "static" | "struct" | "super"
-        | "trait" | "true" | "type" | "unsafe" | "use" | "where" | "while" | "async" | "await"
-        | "dyn" | "abstract" | "become" | "box" | "do" | "final" | "macro" | "override"
-        | "priv" | "typeof" | "unsized" | "virtual" | "yield" | "try" => format!("r#{}", name),
-        _ => name.to_string(),
+fn rust_identifier(name: &str) -> String {
+    if RUST_KEYWORDS.contains(&name) {
+        format!("r#{name}")
+    } else {
+        name.to_string()
     }
+}
+
+fn snake_to_camel(name: &str) -> String {
+    let mut output = String::new();
+    let mut capitalize_next = true;
+
+    for ch in name.chars() {
+        if ch == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            output.extend(ch.to_uppercase());
+            capitalize_next = false;
+        } else {
+            output.push(ch);
+        }
+    }
+
+    output
 }
 
 fn decode_expression(field: &super::parser::Field, current_package: &str) -> String {
@@ -752,11 +950,16 @@ mod tests {
         generator.generate_from_directory(temp_dir.path().to_str().ok_or("invalid temp dir")?)?;
 
         let single_dir = output_dir.join("sensor_msgs");
+        let dispatch_dir = output_dir.join(DISPATCH_CRATE_NAME);
         let members_snippet = fs::read_to_string(output_dir.join("workspace-members.toml"))?;
+        assert!(members_snippet.contains("\"generated/cdr-runtime\","));
+        assert!(members_snippet.contains("\"generated/ros2-dispatch\","));
         assert!(members_snippet.contains("\"generated/geometry_msgs\","));
         assert!(members_snippet.contains("\"generated/sensor_msgs\","));
         assert!(members_snippet.contains("\"generated/std_msgs\","));
         assert!(!members_snippet.contains("[workspace]"));
+        assert!(dispatch_dir.join("Cargo.toml").exists());
+        assert!(dispatch_dir.join("src/lib.rs").exists());
         assert!(single_dir.join("src/lib.rs").exists());
         assert!(single_dir.join("Cargo.toml").exists());
         assert!(single_dir.join("src/msg.rs").exists());
@@ -815,6 +1018,8 @@ mod tests {
 
         let workspace_manifest = fs::read_to_string(workspace_root.join("Cargo.toml"))?;
         assert!(workspace_manifest.contains("\"crates/app\""));
+        assert!(workspace_manifest.contains("\"ros2_msgs/cdr-runtime\""));
+        assert!(workspace_manifest.contains("\"ros2_msgs/ros2-dispatch\""));
         assert!(workspace_manifest.contains("\"ros2_msgs/std_msgs\""));
         assert!(workspace_manifest.contains("\"ros2_msgs/geometry_msgs\""));
         assert!(workspace_manifest.contains("\"ros2_msgs/sensor_msgs\""));
@@ -881,6 +1086,97 @@ mod tests {
         let sensor_manifest = fs::read_to_string(output_dir.join("sensor_msgs/Cargo.toml"))?;
         assert!(sensor_manifest.contains("\"geometry_msgs/serde\""));
         assert!(sensor_manifest.contains("\"std_msgs/serde\""));
+
+        let status = Command::new("cargo")
+            .arg("check")
+            .arg("-p")
+            .arg("app")
+            .current_dir(&workspace_root)
+            .env("CARGO_TARGET_DIR", workspace_root.join("target"))
+            .status()?;
+        assert!(status.success());
+
+        Ok(())
+    }
+
+    #[test]
+    fn generated_dispatch_crate_can_be_imported_from_external_workspace(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let workspace_root = temp_dir.path().join("workspace");
+        let app_dir = workspace_root.join("crates/app");
+        fs::create_dir_all(app_dir.join("src"))?;
+        fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"crates/app\",\n]\nresolver = \"2\"\n",
+        )?;
+        fs::write(
+            app_dir.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nros2-dispatch = { path = \"../../ros2_msgs/ros2-dispatch\" }\n",
+        )?;
+        fs::write(
+            app_dir.join("src/main.rs"),
+            "use ros2_dispatch::{decode_message_by_schema, DecodedMessage};\n\nfn main() {\n    let _ = core::mem::size_of::<DecodedMessage>();\n    let _ = decode_message_by_schema(\"sensor_msgs/msg/Imu\", &[]);\n    let _ = decode_message_by_schema(\"lifecycle_msgs/srv/ChangeState_Request\", &[]);\n}\n",
+        )?;
+
+        let std_pkg_dir = temp_dir.path().join("std_msgs");
+        let std_msg_dir = std_pkg_dir.join("msg");
+        fs::create_dir_all(&std_msg_dir)?;
+        let mut std_file = File::create(std_msg_dir.join("Header.msg"))?;
+        writeln!(std_file, "builtin_interfaces/Time stamp")?;
+        writeln!(std_file, "string frame_id")?;
+
+        let builtin_pkg_dir = temp_dir.path().join("builtin_interfaces");
+        let builtin_msg_dir = builtin_pkg_dir.join("msg");
+        fs::create_dir_all(&builtin_msg_dir)?;
+        let mut time_file = File::create(builtin_msg_dir.join("Time.msg"))?;
+        writeln!(time_file, "int32 sec")?;
+        writeln!(time_file, "uint32 nanosec")?;
+
+        let geometry_pkg_dir = temp_dir.path().join("geometry_msgs");
+        let geometry_msg_dir = geometry_pkg_dir.join("msg");
+        fs::create_dir_all(&geometry_msg_dir)?;
+        let mut quat_file = File::create(geometry_msg_dir.join("Quaternion.msg"))?;
+        writeln!(quat_file, "float64 x")?;
+        writeln!(quat_file, "float64 y")?;
+        writeln!(quat_file, "float64 z")?;
+        writeln!(quat_file, "float64 w")?;
+
+        let sensor_pkg_dir = temp_dir.path().join("sensor_msgs");
+        let sensor_msg_dir = sensor_pkg_dir.join("msg");
+        fs::create_dir_all(&sensor_msg_dir)?;
+        let mut sensor_file = File::create(sensor_msg_dir.join("Imu.msg"))?;
+        writeln!(sensor_file, "std_msgs/Header header")?;
+        writeln!(sensor_file, "geometry_msgs/Quaternion orientation")?;
+        writeln!(sensor_file, "float64[9] orientation_covariance")?;
+
+        let lifecycle_pkg_dir = temp_dir.path().join("lifecycle_msgs");
+        let lifecycle_msg_dir = lifecycle_pkg_dir.join("msg");
+        let lifecycle_srv_dir = lifecycle_pkg_dir.join("srv");
+        fs::create_dir_all(&lifecycle_msg_dir)?;
+        fs::create_dir_all(&lifecycle_srv_dir)?;
+        fs::write(lifecycle_msg_dir.join("Transition.msg"), "uint8 id\nstring label\n")?;
+        fs::write(
+            lifecycle_srv_dir.join("ChangeState.srv"),
+            "Transition transition\n---\nbool success\n",
+        )?;
+
+        let output_dir = workspace_root.join("ros2_msgs");
+        let generator = MessageGenerator::new(output_dir.to_string_lossy().to_string());
+        generator.generate_from_directory(temp_dir.path().to_str().ok_or("invalid temp dir")?)?;
+
+        let dispatch_manifest = fs::read_to_string(output_dir.join("ros2-dispatch/Cargo.toml"))?;
+        assert!(dispatch_manifest.contains("sensor_msgs = { path = \"../sensor_msgs\" }"));
+        assert!(dispatch_manifest.contains("std_msgs = { path = \"../std_msgs\" }"));
+        assert!(dispatch_manifest.contains("geometry_msgs = { path = \"../geometry_msgs\" }"));
+        assert!(dispatch_manifest.contains("lifecycle_msgs = { path = \"../lifecycle_msgs\" }"));
+
+        let dispatch_content = fs::read_to_string(output_dir.join("ros2-dispatch/src/lib.rs"))?;
+        assert!(dispatch_content.contains("pub enum DecodedMessage"));
+        assert!(dispatch_content.contains("sensor_msgs/msg/Imu"));
+        assert!(dispatch_content.contains("lifecycle_msgs/srv/ChangeState_Request"));
+        assert!(dispatch_content.contains("pub fn decode_message_by_schema"));
+        assert!(dispatch_content.contains("pub fn schema_name(&self) -> &'static str"));
 
         let status = Command::new("cargo")
             .arg("check")
@@ -963,6 +1259,31 @@ mod tests {
     }
 
     #[test]
+    fn string_constants_are_quoted_in_codegen_output() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let pkg_dir = temp_dir.path().join("bond");
+        let msg_dir = pkg_dir.join("msg");
+        fs::create_dir_all(&msg_dir)?;
+        fs::write(
+            msg_dir.join("Constants.msg"),
+            "string DISABLE_HEARTBEAT_TIMEOUT_PARAM=/bond_disable_heartbeat_timeout\n",
+        )?;
+
+        let output_dir = temp_dir.path().join("generated");
+        let generator = MessageGenerator::new(output_dir.to_string_lossy().to_string());
+        generator.generate_from_directory(temp_dir.path().to_str().ok_or("invalid temp dir")?)?;
+
+        let msg_content = fs::read_to_string(output_dir.join("bond/src/msg.rs"))?;
+        assert!(
+            msg_content.contains(
+                "pub const DISABLE_HEARTBEAT_TIMEOUT_PARAM: &'static str = \"/bond_disable_heartbeat_timeout\";"
+            )
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn generates_request_response_for_srv() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
         let pkg_dir = temp_dir.path().join("example_interfaces");
@@ -1040,6 +1361,54 @@ mod tests {
         assert!(srv_content.contains("pub const START_AT_FIRST_NODE: i8 = 1;"));
         assert!(!srv_content.contains("pub UNSET: i8,"));
         assert!(!srv_content.contains("pub START_AT_FIRST_NODE: i8,"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn srv_constants_are_not_generated_twice() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let pkg_dir = temp_dir.path().join("slam_toolbox");
+        let srv_dir = pkg_dir.join("srv");
+        fs::create_dir_all(&srv_dir)?;
+        fs::write(
+            srv_dir.join("LoopClosure.srv"),
+            "int8 UNSET=0\n---\nbool success\n",
+        )?;
+
+        let output_dir = temp_dir.path().join("generated");
+        let generator = MessageGenerator::new(output_dir.to_string_lossy().to_string());
+        generator.generate_from_directory(temp_dir.path().to_str().ok_or("invalid temp dir")?)?;
+
+        let srv_content = fs::read_to_string(output_dir.join("slam_toolbox/src/srv.rs"))?;
+        assert_eq!(srv_content.matches("pub const UNSET: i8 = 0;").count(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn struct_name_style_config_is_applied_to_generated_output(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let pkg_dir = temp_dir.path().join("geometry_msgs");
+        let msg_dir = pkg_dir.join("msg");
+        fs::create_dir_all(&msg_dir)?;
+        fs::write(
+            msg_dir.join("robot_status.msg"),
+            "float64 x\nfloat64 y\nfloat64 z\n",
+        )?;
+
+        let output_dir = temp_dir.path().join("generated");
+        let generator = MessageGenerator::with_config(
+            output_dir.to_string_lossy().to_string(),
+            GeneratorConfig::new().with_struct_name_style(StructNameStyle::SnakeCase),
+        );
+        generator.generate_from_directory(temp_dir.path().to_str().ok_or("invalid temp dir")?)?;
+
+        let msg_content = fs::read_to_string(output_dir.join("geometry_msgs/src/msg.rs"))?;
+        let decode_content = fs::read_to_string(output_dir.join("geometry_msgs/src/decode.rs"))?;
+        assert!(msg_content.contains("pub struct robot_status"));
+        assert!(decode_content.contains("impl DecodeCdr for robot_status"));
 
         Ok(())
     }

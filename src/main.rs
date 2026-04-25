@@ -13,7 +13,6 @@ fn print_usage(program: &str) {
     eprintln!("  -e, --env <var>        Generate from environment variable");
     eprintln!("  -r, --ros-env          Auto-detect ROS environment variables");
     eprintln!("  --snake-case           Use snake_case struct names");
-    eprintln!("  --no-msg-suffix         Don't include /msg/ in type names");
     eprintln!("  -h, --help            Show this help message");
     eprintln!();
     eprintln!("EXAMPLES:");
@@ -24,7 +23,7 @@ fn print_usage(program: &str) {
     eprintln!("  {} -e AMENT_PREFIX_PATH generated_pkg", program);
     eprintln!("  {} -r generated_pkg", program);
     eprintln!(
-        "  {} --snake-case --no-msg-suffix -d /mnt/ubuntu/opt/ros/humble/share custom_pkg",
+        "  {} --snake-case -d /mnt/ubuntu/opt/ros/humble/share custom_pkg",
         program
     );
 }
@@ -68,10 +67,6 @@ fn main() {
             }
             "--snake-case" => {
                 config = config.with_struct_name_style(StructNameStyle::SnakeCase);
-                i += 1;
-            }
-            "--no-msg-suffix" => {
-                config = config.with_include_msg_suffix(false);
                 i += 1;
             }
             arg if arg.starts_with('-') => {

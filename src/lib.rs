@@ -10,7 +10,8 @@
 //! - Support for arrays and complex types
 //! - Generate one crate per ROS package
 //! - Auto-generate package `Cargo.toml` files and local `path` dependencies
-//! - Emit a placeholder `decode.rs` for future backend integration
+//! - Generate a shared `ros2-dispatch` crate for schema-based decode dispatch
+//! - Generate `decode.rs` with `DecodeCdr` implementations
 //! - Configurable naming conventions
 //!
 //! # Quick Start
@@ -44,10 +45,8 @@
 //! }
 //! ```
 
-pub mod macros;
 pub mod parser;
 
-pub use macros::{MessageRegistry, ParseError, RosMessage, SimpleRegistry};
 pub use parser::{Field, MessageType, StructNameStyle};
 
 mod generator;
@@ -55,10 +54,7 @@ pub use generator::{GeneratorConfig, MessageGenerator};
 
 /// Re-export of commonly used items
 pub mod prelude {
-    pub use crate::{
-        Field, GeneratorConfig, MessageGenerator, MessageRegistry, MessageType, ParseError,
-        RosMessage, SimpleRegistry, StructNameStyle,
-    };
+    pub use crate::{Field, GeneratorConfig, MessageGenerator, MessageType, StructNameStyle};
 
     pub use serde::{Deserialize, Serialize};
 }

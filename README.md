@@ -32,11 +32,13 @@ This project is still evolving, but the current generator already supports:
 - parsing ROS 2 `.msg` and `.srv` files
 - generating one Rust crate per ROS package
 - generating a shared `cdr-runtime` crate
+- generating a shared `ros2-dispatch` crate
 - generating `decode.rs` with automatic `DecodeCdr` impls for all generated message types
 
 The runtime and output layout may still change, but the current path is:
 
 - shared `cdr-runtime`
+- shared `ros2-dispatch`
 - generated package crates with `msg.rs`, `srv.rs`, and `decode.rs`
 - explicit, inspectable decode logic instead of ROS runtime bindings
 
@@ -48,6 +50,7 @@ The runtime and output layout may still change, but the current path is:
 - Cross-package type references such as `geometry_msgs::msg::Quaternion`
 - Auto-generate per-package `Cargo.toml` files and local `path` dependencies
 - Generate a shared `cdr-runtime` crate
+- Generate a shared `ros2-dispatch` crate with schema-based decode dispatch
 - Generate `decode.rs` with automatic `DecodeCdr` implementations
 - Configurable naming conventions
 - Standalone binary tool
@@ -95,6 +98,10 @@ generated_ws/
 │   ├── Cargo.toml
 │   └── src
 │       └── lib.rs
+├── ros2-dispatch
+│   ├── Cargo.toml
+│   └── src
+│       └── lib.rs
 ├── geometry_msgs
 │   ├── Cargo.toml
 │   └── src
@@ -115,6 +122,7 @@ generated_ws/
 Notes:
 
 - `cdr-runtime` is shared by all generated package crates.
+- `ros2-dispatch` depends on generated package crates and provides schema-based dynamic decode.
 - Each package crate gets its own `Cargo.toml`.
 - Cross-package references are emitted as normal Rust crate paths.
 - `decode.rs` is generated code, not a placeholder. It re-exports runtime items and adds
@@ -160,6 +168,46 @@ impl DecodeCdr for Imu {
 }
 ```
 
+Generated schema dispatch code is emitted in `ros2-dispatch/src/lib.rs`, for example:
+
+```rust
+#[derive(Clone, Debug)]
+pub enum DecodedMessage {
+    SensorMsgsImu(sensor_msgs::msg::Imu),
+    LifecycleMsgsChangeStateRequest(lifecycle_msgs::srv::ChangeStateRequest),
+}
+
+impl DecodedMessage {
+    pub fn schema_name(&self) -> &'static str {
+        match self {
+            Self::SensorMsgsImu(_) => "sensor_msgs/msg/Imu",
+            Self::LifecycleMsgsChangeStateRequest(_) => {
+                "lifecycle_msgs/srv/ChangeState_Request"
+            }
+        }
+    }
+}
+
+pub fn decode_message_by_schema(
+    schema_name: &str,
+    data: &[u8],
+) -> Result<DecodedMessage, String> {
+    match schema_name {
+        "sensor_msgs/msg/Imu" => Ok(DecodedMessage::SensorMsgsImu(
+            sensor_msgs::decode::decode_from_bytes::<sensor_msgs::msg::Imu>(data)?,
+        )),
+        "lifecycle_msgs/srv/ChangeState_Request" => {
+            Ok(DecodedMessage::LifecycleMsgsChangeStateRequest(
+                lifecycle_msgs::decode::decode_from_bytes::<
+                    lifecycle_msgs::srv::ChangeStateRequest,
+                >(data)?,
+            ))
+        }
+        _ => Err(format!("unknown schema: {schema_name}")),
+    }
+}
+```
+
 ## Minimal Integration Example
 
 ### 1. Generate Package Crates
@@ -200,6 +248,13 @@ geometry_msgs = { path = "../generated_interfaces/geometry_msgs", features = ["s
 std_msgs = { path = "../generated_interfaces/std_msgs", features = ["serde"] }
 ```
 
+If you want schema-based dynamic decode, also depend on the generated dispatch crate:
+
+```toml
+[dependencies]
+ros2-dispatch = { path = "../generated_interfaces/ros2-dispatch" }
+```
+
 ### 4. Use Generated Types
 
 ```rust
@@ -222,7 +277,33 @@ fn parse_imu(bytes: &[u8]) -> Result<Imu, String> {
 }
 ```
 
-### 6. Add Generated Packages to an Existing Workspace
+### 6. Decode by Schema Name
+
+```rust
+use ros2_dispatch::{decode_message_by_schema, DecodedMessage};
+
+fn parse_dynamic(schema_name: &str, bytes: &[u8]) -> Result<(), String> {
+    let message = decode_message_by_schema(schema_name, bytes)?;
+
+    match &message {
+        DecodedMessage::SensorMsgsImu(msg) => {
+            let _ = &msg.orientation;
+        }
+        _ => {}
+    }
+
+    let _schema = message.schema_name();
+    Ok(())
+}
+```
+
+Currently `ros2-dispatch` includes:
+
+- `.msg` schema names such as `sensor_msgs/msg/Imu`
+- `.srv` request schema names such as `lifecycle_msgs/srv/ChangeState_Request`
+- `.srv` response schema names such as `lifecycle_msgs/srv/ChangeState_Response`
+
+### 7. Add Generated Packages to an Existing Workspace
 
 If `generated_interfaces/` lives inside an existing Cargo workspace, the generator will try
 to append entries like these to the top-level workspace `Cargo.toml` automatically:
@@ -231,6 +312,7 @@ to append entries like these to the top-level workspace `Cargo.toml` automatical
 members = [
     "crates/app",
     "generated_interfaces/cdr-runtime",
+    "generated_interfaces/ros2-dispatch",
     "generated_interfaces/std_msgs",
     "generated_interfaces/geometry_msgs",
     "generated_interfaces/sensor_msgs",
