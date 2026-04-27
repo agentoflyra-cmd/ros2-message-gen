@@ -17,6 +17,7 @@ The goal is to build a lightweight Rust toolchain that can:
 
 - generate Rust structs from `.msg` and `.srv` definitions
 - decode ROS 2 CDR-encoded message payloads
+- encode generated message types back into ROS 2 CDR payloads
 - work without a ROS 2 runtime binding
 
 This is aimed at workflows such as:
@@ -34,13 +35,14 @@ This project is still evolving, but the current generator already supports:
 - generating a shared `cdr-runtime` crate
 - generating a shared `ros2-dispatch` crate
 - generating `decode.rs` with automatic `DecodeCdr` impls for all generated message types
+- generating `encode.rs` with automatic `EncodeCdr` impls for all generated message types
 
 The runtime and output layout may still change, but the current path is:
 
 - shared `cdr-runtime`
 - shared `ros2-dispatch`
-- generated package crates with `msg.rs`, `srv.rs`, and `decode.rs`
-- explicit, inspectable decode logic instead of ROS runtime bindings
+- generated package crates with `msg.rs`, `srv.rs`, `decode.rs`, and `encode.rs`
+- explicit, inspectable encode/decode logic instead of ROS runtime bindings
 
 ## Features
 
@@ -50,8 +52,9 @@ The runtime and output layout may still change, but the current path is:
 - Cross-package type references such as `geometry_msgs::msg::Quaternion`
 - Auto-generate per-package `Cargo.toml` files and local `path` dependencies
 - Generate a shared `cdr-runtime` crate
-- Generate a shared `ros2-dispatch` crate with schema-based decode dispatch
+- Generate a shared `ros2-dispatch` crate with schema-based decode and encode dispatch
 - Generate `decode.rs` with automatic `DecodeCdr` implementations
+- Generate `encode.rs` with automatic `EncodeCdr` implementations
 - Configurable naming conventions
 - Standalone binary tool
 - Library integration
@@ -106,6 +109,7 @@ generated_ws/
 │   ├── Cargo.toml
 │   └── src
 │       ├── decode.rs
+│       ├── encode.rs
 │       ├── lib.rs
 │       ├── msg.rs
 │       └── srv.rs
@@ -113,6 +117,7 @@ generated_ws/
 │   ├── Cargo.toml
 │   └── src
 │       ├── decode.rs
+│       ├── encode.rs
 │       ├── lib.rs
 │       ├── msg.rs
 │       └── srv.rs
@@ -122,11 +127,14 @@ generated_ws/
 Notes:
 
 - `cdr-runtime` is shared by all generated package crates.
-- `ros2-dispatch` depends on generated package crates and provides schema-based dynamic decode.
+- `ros2-dispatch` depends on generated package crates and provides schema-based dynamic decode,
+  plus enum-based re-encoding after mutation.
 - Each package crate gets its own `Cargo.toml`.
 - Cross-package references are emitted as normal Rust crate paths.
 - `decode.rs` is generated code, not a placeholder. It re-exports runtime items and adds
   `impl DecodeCdr for T` for all generated message and service request/response types.
+- `encode.rs` is generated alongside `decode.rs`. It re-exports runtime items and adds
+  `impl EncodeCdr for T` for all generated message and service request/response types.
 
 The output directory itself is not generated as a Cargo workspace root. This avoids nested
 workspace conflicts when you place generated crates inside an existing workspace.
@@ -168,6 +176,24 @@ impl DecodeCdr for Imu {
 }
 ```
 
+Generated encode code is emitted separately in `encode.rs`, for example:
+
+```rust
+pub use cdr_runtime::{encode_to_vec, CdrEncoder, EncodeCdr, Endianness, WChar16, WChar32};
+
+impl EncodeCdr for Imu {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        <std_msgs::msg::Header as EncodeCdr>::encode_cdr(&self.header, encoder)?;
+        <geometry_msgs::msg::Quaternion as EncodeCdr>::encode_cdr(
+            &self.orientation,
+            encoder,
+        )?;
+        encoder.write_array::<f64, _>(&self.orientation_covariance)?;
+        Ok(())
+    }
+}
+```
+
 Generated schema dispatch code is emitted in `ros2-dispatch/src/lib.rs`, for example:
 
 ```rust
@@ -183,6 +209,15 @@ impl DecodedMessage {
             Self::SensorMsgsImu(_) => "sensor_msgs/msg/Imu",
             Self::LifecycleMsgsChangeStateRequest(_) => {
                 "lifecycle_msgs/srv/ChangeState_Request"
+            }
+        }
+    }
+
+    pub fn encode_to_vec(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::SensorMsgsImu(msg) => sensor_msgs::encode::encode_to_vec(msg),
+            Self::LifecycleMsgsChangeStateRequest(msg) => {
+                lifecycle_msgs::encode::encode_to_vec(msg)
             }
         }
     }
@@ -303,7 +338,37 @@ Currently `ros2-dispatch` includes:
 - `.srv` request schema names such as `lifecycle_msgs/srv/ChangeState_Request`
 - `.srv` response schema names such as `lifecycle_msgs/srv/ChangeState_Response`
 
-### 7. Add Generated Packages to an Existing Workspace
+### 7. Decode, Mutate, and Re-encode Dynamically
+
+```rust
+use ros2_dispatch::{decode_message_by_schema, DecodedMessage};
+
+fn patch_and_reencode(schema_name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut message = decode_message_by_schema(schema_name, bytes)?;
+
+    match &mut message {
+        DecodedMessage::SensorMsgsImu(msg) => {
+            msg.orientation_covariance[0] = 1.0;
+        }
+        _ => {}
+    }
+
+    message.encode_to_vec()
+}
+```
+
+### 8. Encode a Generated Message
+
+```rust
+use sensor_msgs::encode::encode_to_vec;
+use sensor_msgs::msg::Imu;
+
+fn encode_imu(msg: &Imu) -> Result<Vec<u8>, String> {
+    encode_to_vec(msg)
+}
+```
+
+### 9. Add Generated Packages to an Existing Workspace
 
 If `generated_interfaces/` lives inside an existing Cargo workspace, the generator will try
 to append entries like these to the top-level workspace `Cargo.toml` automatically:

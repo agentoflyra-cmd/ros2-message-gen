@@ -20,6 +20,15 @@ pub trait DecodeCdr: Sized {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String>;
 }
 
+pub struct CdrEncoder {
+    pub data_raw: Vec<u8>,
+    pub endianness: Endianness,
+}
+
+pub trait EncodeCdr: Sized {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WChar16(pub char);
 
@@ -32,6 +41,20 @@ pub struct CdrEncoding {
 }
 
 impl CdrEncoding {
+    pub fn serialize(value: &Self) -> Vec<u8> {
+        let rep = match (&value.cdr_representation, &value.endianness) {
+            (CdrRepresentation::Xcdr1, Endianness::Big) => 0x0000u16,
+            (CdrRepresentation::Xcdr1, Endianness::Little) => 0x0001u16,
+            (CdrRepresentation::Xcdr2, Endianness::Big) => 0x0002u16,
+            (CdrRepresentation::Xcdr2, Endianness::Little) => 0x0003u16,
+        };
+
+        let mut bytes = Vec::with_capacity(4);
+        bytes.extend_from_slice(&rep.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes
+    }
+
     pub fn parse(data: &[u8]) -> Result<(Self, &[u8]), String> {
         if data.len() < 4 {
             return Err("CdrEncoding: parse_from: len should be longer than 4".to_string());
@@ -492,14 +515,202 @@ impl<'a> CdrDecoder<'a> {
     }
 }
 
+impl CdrEncoder {
+    pub fn new(cdr_encoding: CdrEncoding) -> Self {
+        let data_raw = CdrEncoding::serialize(&cdr_encoding);
+        Self {
+            data_raw,
+            endianness: cdr_encoding.endianness,
+        }
+    }
+
+    pub fn align_to(&mut self, align_length: usize) {
+        debug_assert!(align_length > 0);
+        let pos = self.data_raw.len().saturating_sub(4);
+        let padding_length = (align_length - pos % align_length) % align_length;
+        self.data_raw
+            .resize(self.data_raw.len() + padding_length, 0);
+    }
+
+    pub fn write_wstring(&mut self, value: &str) {
+        let utf16: Vec<u16> = value.encode_utf16().collect();
+        self.write_u32((utf16.len() + 1) as u32);
+        for unit in utf16 {
+            self.write_u16(unit);
+        }
+        self.write_u16(0);
+    }
+
+    pub fn write_string(&mut self, value: &str) {
+        let bytes = value.as_bytes();
+        self.write_u32((bytes.len() + 1) as u32);
+        self.write_bytes_raw(bytes.to_vec());
+        self.write_u8(0);
+    }
+
+    pub fn write_wchar32(&mut self, value: char) {
+        self.write_u32(value as u32);
+    }
+
+    pub fn write_wchar16(&mut self, value: char) {
+        let mut buffer = [0; 2];
+        let wchar16 = value.encode_utf16(&mut buffer)[0];
+        self.write_u16(wchar16);
+    }
+
+    pub fn write_char_u8(&mut self, value: u8) {
+        self.write_u8(value);
+    }
+
+    pub fn write_char(&mut self, value: char) -> Result<(), String> {
+        if !value.is_ascii() {
+            return Err("CdrEncoder: write_char: char is not ascii code.".to_string());
+        }
+        self.write_u8(value as u8);
+        Ok(())
+    }
+
+    pub fn write_u16(&mut self, value: u16) {
+        let data = match self.endianness {
+            Endianness::Big => value.to_be_bytes(),
+            Endianness::Little => value.to_le_bytes(),
+        }
+        .to_vec();
+        self.align_to(size_of::<u16>());
+        self.write_bytes_raw(data);
+    }
+
+    pub fn write_u8(&mut self, value: u8) {
+        self.data_raw.push(value);
+    }
+
+    pub fn write_bool(&mut self, value: bool) {
+        self.write_u8(if value { 1 } else { 0 });
+    }
+
+    pub fn write_i8(&mut self, value: i8) {
+        self.write_bytes_raw(value.to_ne_bytes().to_vec());
+    }
+
+    pub fn write_u32(&mut self, value: u32) {
+        let data = match self.endianness {
+            Endianness::Big => value.to_be_bytes(),
+            Endianness::Little => value.to_le_bytes(),
+        }
+        .to_vec();
+        self.align_to(size_of::<u32>());
+        self.write_bytes_raw(data);
+    }
+
+    pub fn write_u64(&mut self, value: u64) {
+        let data = match self.endianness {
+            Endianness::Big => value.to_be_bytes(),
+            Endianness::Little => value.to_le_bytes(),
+        }
+        .to_vec();
+        self.align_to(size_of::<u64>());
+        self.write_bytes_raw(data);
+    }
+
+    pub fn write_i16(&mut self, value: i16) {
+        let data = match self.endianness {
+            Endianness::Big => value.to_be_bytes(),
+            Endianness::Little => value.to_le_bytes(),
+        }
+        .to_vec();
+        self.align_to(size_of::<i16>());
+        self.write_bytes_raw(data);
+    }
+
+    pub fn write_i32(&mut self, value: i32) {
+        let data = match self.endianness {
+            Endianness::Big => value.to_be_bytes(),
+            Endianness::Little => value.to_le_bytes(),
+        }
+        .to_vec();
+        self.align_to(size_of::<i32>());
+        self.write_bytes_raw(data);
+    }
+
+    pub fn write_i64(&mut self, value: i64) {
+        let data = match self.endianness {
+            Endianness::Big => value.to_be_bytes(),
+            Endianness::Little => value.to_le_bytes(),
+        }
+        .to_vec();
+        self.align_to(size_of::<i64>());
+        self.write_bytes_raw(data);
+    }
+
+    pub fn write_f32(&mut self, value: f32) {
+        let data = match self.endianness {
+            Endianness::Big => value.to_be_bytes(),
+            Endianness::Little => value.to_le_bytes(),
+        }
+        .to_vec();
+        self.align_to(size_of::<f32>());
+        self.write_bytes_raw(data);
+    }
+
+    pub fn write_f64(&mut self, value: f64) {
+        let data = match self.endianness {
+            Endianness::Big => value.to_be_bytes(),
+            Endianness::Little => value.to_le_bytes(),
+        }
+        .to_vec();
+        self.align_to(size_of::<f64>());
+        self.write_bytes_raw(data);
+    }
+
+    pub fn write_bytes_raw(&mut self, value: Vec<u8>) {
+        self.data_raw.extend_from_slice(&value);
+    }
+
+    pub fn write_octet_bytes(&mut self, value: Vec<u8>) {
+        self.write_u32(value.len() as u32);
+        self.write_bytes_raw(value);
+    }
+
+    pub fn write_seq<T: EncodeCdr>(&mut self, value: &[T]) -> Result<(), String> {
+        self.write_u32(value.len() as u32);
+        for item in value {
+            item.encode_cdr(self)?;
+        }
+        Ok(())
+    }
+
+    pub fn write_array<T: EncodeCdr, const N: usize>(&mut self, value: &[T; N]) -> Result<(), String> {
+        for item in value {
+            item.encode_cdr(self)?;
+        }
+        Ok(())
+    }
+}
+
 pub fn decode_from_bytes<T: DecodeCdr>(bytes: &[u8]) -> Result<T, String> {
     let mut cdr_decoder = CdrDecoder::new(bytes)?;
     T::decode_cdr(&mut cdr_decoder)
 }
 
+pub fn encode_to_vec<T: EncodeCdr>(value: &T) -> Result<Vec<u8>, String> {
+    let mut encoder = CdrEncoder::new(CdrEncoding {
+        cdr_representation: CdrRepresentation::Xcdr1,
+        endianness: Endianness::Little,
+    });
+    value.encode_cdr(&mut encoder)?;
+    Ok(encoder.data_raw)
+}
+
 impl DecodeCdr for bool {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
         decoder.read_bool()
+    }
+}
+
+impl EncodeCdr for bool {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_bool(*self);
+        Ok(())
     }
 }
 
@@ -509,9 +720,23 @@ impl DecodeCdr for u8 {
     }
 }
 
+impl EncodeCdr for u8 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_u8(*self);
+        Ok(())
+    }
+}
+
 impl DecodeCdr for u16 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
         decoder.read_u16()
+    }
+}
+
+impl EncodeCdr for u16 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_u16(*self);
+        Ok(())
     }
 }
 
@@ -521,9 +746,23 @@ impl DecodeCdr for u32 {
     }
 }
 
+impl EncodeCdr for u32 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_u32(*self);
+        Ok(())
+    }
+}
+
 impl DecodeCdr for u64 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
         decoder.read_u64()
+    }
+}
+
+impl EncodeCdr for u64 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_u64(*self);
+        Ok(())
     }
 }
 
@@ -533,9 +772,23 @@ impl DecodeCdr for i8 {
     }
 }
 
+impl EncodeCdr for i8 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_i8(*self);
+        Ok(())
+    }
+}
+
 impl DecodeCdr for i16 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
         decoder.read_i16()
+    }
+}
+
+impl EncodeCdr for i16 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_i16(*self);
+        Ok(())
     }
 }
 
@@ -545,9 +798,23 @@ impl DecodeCdr for i32 {
     }
 }
 
+impl EncodeCdr for i32 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_i32(*self);
+        Ok(())
+    }
+}
+
 impl DecodeCdr for i64 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
         decoder.read_i64()
+    }
+}
+
+impl EncodeCdr for i64 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_i64(*self);
+        Ok(())
     }
 }
 
@@ -557,9 +824,23 @@ impl DecodeCdr for f32 {
     }
 }
 
+impl EncodeCdr for f32 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_f32(*self);
+        Ok(())
+    }
+}
+
 impl DecodeCdr for f64 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
         decoder.read_f64()
+    }
+}
+
+impl EncodeCdr for f64 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_f64(*self);
+        Ok(())
     }
 }
 
@@ -569,9 +850,22 @@ impl DecodeCdr for char {
     }
 }
 
+impl EncodeCdr for char {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_char(*self)
+    }
+}
+
 impl DecodeCdr for String {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
         decoder.read_string()
+    }
+}
+
+impl EncodeCdr for String {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_string(self);
+        Ok(())
     }
 }
 
@@ -581,15 +875,32 @@ impl DecodeCdr for WChar16 {
     }
 }
 
+impl EncodeCdr for WChar16 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_wchar16(self.0);
+        Ok(())
+    }
+}
+
 impl DecodeCdr for WChar32 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
         decoder.read_wchar_u32().map(Self)
     }
 }
 
+impl EncodeCdr for WChar32 {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+        encoder.write_wchar32(self.0);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::{decode_from_bytes, CdrDecoder, WChar16, WChar32};
+    use super::{
+        decode_from_bytes, encode_to_vec, CdrDecoder, CdrEncoder, CdrEncoding,
+        CdrRepresentation, DecodeCdr, EncodeCdr, Endianness, WChar16, WChar32,
+    };
 
     fn little_endian_message(payload: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0x00, 0x01, 0x00, 0x00];
@@ -698,5 +1009,41 @@ mod test {
             decode_from_bytes::<WChar32>(&wchar32_bytes).expect("wchar32 should decode"),
             WChar32('B')
         );
+    }
+
+    #[test]
+    fn encode_round_trips_primitives() {
+        let bytes = encode_to_vec(&42u32).expect("u32 should encode");
+        assert_eq!(decode_from_bytes::<u32>(&bytes).expect("u32 should decode"), 42);
+
+        let bytes = encode_to_vec(&-7i16).expect("i16 should encode");
+        assert_eq!(decode_from_bytes::<i16>(&bytes).expect("i16 should decode"), -7);
+
+        let bytes = encode_to_vec(&3.5f32).expect("f32 should encode");
+        assert_eq!(decode_from_bytes::<f32>(&bytes).expect("f32 should decode"), 3.5);
+    }
+
+    #[test]
+    fn encode_round_trips_string() {
+        let value = String::from("abc");
+        let bytes = encode_to_vec(&value).expect("string should encode");
+        assert_eq!(
+            decode_from_bytes::<String>(&bytes).expect("string should decode"),
+            value
+        );
+    }
+
+    #[test]
+    fn encoder_aligns_u64_after_u8() {
+        let mut encoder = CdrEncoder::new(CdrEncoding {
+            cdr_representation: CdrRepresentation::Xcdr1,
+            endianness: Endianness::Little,
+        });
+        7u8.encode_cdr(&mut encoder).expect("u8 should encode");
+        42u64.encode_cdr(&mut encoder).expect("u64 should encode");
+
+        let mut decoder = CdrDecoder::new(&encoder.data_raw).expect("decoder should be created");
+        assert_eq!(decoder.read_u8().expect("u8 should decode"), 7);
+        assert_eq!(decoder.read_u64().expect("u64 should decode"), 42);
     }
 }

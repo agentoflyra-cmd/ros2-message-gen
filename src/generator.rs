@@ -135,6 +135,7 @@ impl MessageGenerator {
     ///
     /// `output_path` 现在表示输出目录，会生成以下布局：
     /// - `src/lib.rs`
+    /// - `src/encode.rs`
     /// - `src/msg.rs`
     /// - `src/srv.rs`
     /// - `src/decode.rs`
@@ -327,7 +328,7 @@ impl MessageGenerator {
 
         fs::write(
             src_dir.join("lib.rs"),
-            "pub mod decode;\npub mod msg;\npub mod srv;\n",
+            "pub mod decode;\npub mod encode;\npub mod msg;\npub mod srv;\n",
         )?;
 
         let mut msg_rs = String::new();
@@ -346,9 +347,11 @@ impl MessageGenerator {
         srv_rs.push_str(generate_srv_module(services, self.config.struct_name_style).as_str());
 
         let decode_rs = generate_decode_module(messages, services, self.config.struct_name_style);
+        let encode_rs = generate_encode_module(messages, services, self.config.struct_name_style);
         fs::write(src_dir.join("msg.rs"), msg_rs)?;
         fs::write(src_dir.join("srv.rs"), srv_rs)?;
         fs::write(src_dir.join("decode.rs"), decode_rs)?;
+        fs::write(src_dir.join("encode.rs"), encode_rs)?;
 
         Ok(())
     }
@@ -646,6 +649,35 @@ fn generate_decode_module(
     content
 }
 
+fn generate_encode_module(
+    messages: &[&MessageType],
+    services: &[(&MessageType, &MessageType)],
+    style: StructNameStyle,
+) -> String {
+    let mut scope = Scope::new();
+
+    for msg in messages {
+        add_encode_impl(&mut scope, msg, style);
+    }
+
+    for (request, response) in services {
+        add_encode_impl(&mut scope, request, style);
+        add_encode_impl(&mut scope, response, style);
+    }
+
+    let mut content = String::new();
+    content.push_str("#[allow(unused_imports)]\n");
+    content.push_str("use crate::msg::*;\n");
+    content.push_str("#[allow(unused_imports)]\n");
+    content.push_str("use crate::srv::*;\n");
+    content.push_str("#[allow(unused_imports)]\n");
+    content.push_str(
+        "pub use cdr_runtime::{encode_to_vec, CdrEncoder, EncodeCdr, Endianness, WChar16, WChar32};\n\n",
+    );
+    content.push_str(&scope.to_string());
+    content
+}
+
 fn generate_dispatch_module(
     messages: &[MessageType],
     services: &[(MessageType, MessageType)],
@@ -687,6 +719,18 @@ fn generate_dispatch_module(
     }
     content.push_str("        }\n");
     content.push_str("    }\n");
+    content.push_str("\n");
+    content.push_str("    pub fn encode_to_vec(&self) -> Result<Vec<u8>, std::string::String> {\n");
+    content.push_str("        match self {\n");
+    for entry in &entries {
+        content.push_str(&format!(
+            "            Self::{variant}(msg) => {encode_fn}(msg),\n",
+            variant = entry.variant_name,
+            encode_fn = entry.encode_fn_path,
+        ));
+    }
+    content.push_str("        }\n");
+    content.push_str("    }\n");
     content.push_str("}\n\n");
 
     content.push_str(
@@ -715,6 +759,7 @@ struct DispatchEntry {
     schema_name: String,
     type_path: String,
     decode_fn_path: String,
+    encode_fn_path: String,
 }
 
 fn dispatch_entries(
@@ -730,6 +775,7 @@ fn dispatch_entries(
             schema_name: dispatch_message_schema_name(message),
             type_path: dispatch_msg_type_path(message, style),
             decode_fn_path: dispatch_decode_fn_path(message),
+            encode_fn_path: dispatch_encode_fn_path(message),
         });
     }
 
@@ -739,12 +785,14 @@ fn dispatch_entries(
             schema_name: dispatch_service_schema_name(request, "Request"),
             type_path: dispatch_srv_type_path(request, style),
             decode_fn_path: dispatch_decode_fn_path(request),
+            encode_fn_path: dispatch_encode_fn_path(request),
         });
         entries.push(DispatchEntry {
             variant_name: dispatch_variant_name(response),
             schema_name: dispatch_service_schema_name(response, "Response"),
             type_path: dispatch_srv_type_path(response, style),
             decode_fn_path: dispatch_decode_fn_path(response),
+            encode_fn_path: dispatch_encode_fn_path(response),
         });
     }
 
@@ -791,12 +839,24 @@ fn dispatch_decode_fn_path(message: &MessageType) -> String {
     format!("{}::decode::decode_from_bytes", message.package)
 }
 
+fn dispatch_encode_fn_path(message: &MessageType) -> String {
+    format!("{}::encode::encode_to_vec", message.package)
+}
+
 fn add_decode_impl(scope: &mut Scope, message: &MessageType, style: StructNameStyle) {
     let struct_name = message.struct_name(style);
     let imp = scope.new_impl(&struct_name);
     imp.impl_trait("DecodeCdr");
     let function = imp.new_fn("decode_cdr");
     configure_decode_function(function, message);
+}
+
+fn add_encode_impl(scope: &mut Scope, message: &MessageType, style: StructNameStyle) {
+    let struct_name = message.struct_name(style);
+    let imp = scope.new_impl(&struct_name);
+    imp.impl_trait("EncodeCdr");
+    let function = imp.new_fn("encode_cdr");
+    configure_encode_function(function, message);
 }
 
 fn configure_decode_function(function: &mut Function, message: &MessageType) {
@@ -811,6 +871,16 @@ fn configure_decode_function(function: &mut Function, message: &MessageType) {
         ));
     }
     function.line("})");
+}
+
+fn configure_encode_function(function: &mut Function, message: &MessageType) {
+    function.arg_ref_self();
+    function.arg("encoder", "&mut CdrEncoder");
+    function.ret("Result<(), String>");
+    for field in &message.fields {
+        function.line(encode_statement(field, &message.package));
+    }
+    function.line("Ok(())");
 }
 
 fn rust_identifier(name: &str) -> String {
@@ -853,6 +923,23 @@ fn decode_expression(field: &super::parser::Field, current_package: &str) -> Str
         }
     } else {
         format!("<{} as DecodeCdr>::decode_cdr(decoder)?", base_type)
+    }
+}
+
+fn encode_statement(field: &super::parser::Field, current_package: &str) -> String {
+    let base_type = field.rust_type(current_package);
+    let field_name = rust_identifier(&field.name);
+    if field.is_array {
+        if field.array_size.is_some() {
+            format!("encoder.write_array::<{}, _>(&self.{})?;", strip_container_type(&base_type), field_name)
+        } else {
+            format!("encoder.write_seq::<{}>(&self.{})?;", strip_vec_type(&base_type), field_name)
+        }
+    } else {
+        format!(
+            "<{} as EncodeCdr>::encode_cdr(&self.{}, encoder)?;",
+            base_type, field_name
+        )
     }
 }
 
@@ -965,6 +1052,7 @@ mod tests {
         assert!(single_dir.join("src/msg.rs").exists());
         assert!(single_dir.join("src/srv.rs").exists());
         assert!(single_dir.join("src/decode.rs").exists());
+        assert!(single_dir.join("src/encode.rs").exists());
 
         let package_manifest = fs::read_to_string(single_dir.join("Cargo.toml"))?;
         assert!(package_manifest.contains("geometry_msgs = { path = \"../geometry_msgs\" }"));
@@ -1045,7 +1133,7 @@ mod tests {
         )?;
         fs::write(
             app_dir.join("src/main.rs"),
-            "use sensor_msgs::msg::Imu;\n\nfn main() {\n    let _ = core::mem::size_of::<Imu>();\n}\n",
+            "use sensor_msgs::encode::encode_to_vec;\nuse sensor_msgs::msg::Imu;\n\nfn encode(msg: &Imu) -> Result<Vec<u8>, String> {\n    encode_to_vec(msg)\n}\n\nfn main() {\n    let _ = core::mem::size_of::<Imu>();\n    let _ = encode as fn(&Imu) -> Result<Vec<u8>, String>;\n}\n",
         )?;
 
         let std_pkg_dir = temp_dir.path().join("std_msgs");
@@ -1086,6 +1174,9 @@ mod tests {
         let sensor_manifest = fs::read_to_string(output_dir.join("sensor_msgs/Cargo.toml"))?;
         assert!(sensor_manifest.contains("\"geometry_msgs/serde\""));
         assert!(sensor_manifest.contains("\"std_msgs/serde\""));
+        let sensor_encode = fs::read_to_string(output_dir.join("sensor_msgs/src/encode.rs"))?;
+        assert!(sensor_encode.contains("pub use cdr_runtime::{encode_to_vec, CdrEncoder, EncodeCdr"));
+        assert!(sensor_encode.contains("impl EncodeCdr for Imu"));
 
         let status = Command::new("cargo")
             .arg("check")
@@ -1116,7 +1207,7 @@ mod tests {
         )?;
         fs::write(
             app_dir.join("src/main.rs"),
-            "use ros2_dispatch::{decode_message_by_schema, DecodedMessage};\n\nfn main() {\n    let _ = core::mem::size_of::<DecodedMessage>();\n    let _ = decode_message_by_schema(\"sensor_msgs/msg/Imu\", &[]);\n    let _ = decode_message_by_schema(\"lifecycle_msgs/srv/ChangeState_Request\", &[]);\n}\n",
+            "use ros2_dispatch::{decode_message_by_schema, DecodedMessage};\n\nfn main() {\n    let _ = core::mem::size_of::<DecodedMessage>();\n    let _ = decode_message_by_schema(\"sensor_msgs/msg/Imu\", &[]);\n    let _ = decode_message_by_schema(\"lifecycle_msgs/srv/ChangeState_Request\", &[]);\n    let _encode: fn(&DecodedMessage) -> Result<Vec<u8>, String> = DecodedMessage::encode_to_vec;\n}\n",
         )?;
 
         let std_pkg_dir = temp_dir.path().join("std_msgs");
@@ -1177,6 +1268,7 @@ mod tests {
         assert!(dispatch_content.contains("lifecycle_msgs/srv/ChangeState_Request"));
         assert!(dispatch_content.contains("pub fn decode_message_by_schema"));
         assert!(dispatch_content.contains("pub fn schema_name(&self) -> &'static str"));
+        assert!(dispatch_content.contains("pub fn encode_to_vec(&self) -> Result<Vec<u8>, std::string::String>"));
 
         let status = Command::new("cargo")
             .arg("check")
