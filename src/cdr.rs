@@ -59,7 +59,6 @@ impl CdrEncoding {
         if data.len() < 4 {
             return Err("CdrEncoding: parse_from: len should be longer than 4".to_string());
         }
-        // let mask = [0x0, 0x1, 0x2, 0x3];
 
         let rep = u16::from_be_bytes([data[0], data[1]]);
         let _options = u16::from_be_bytes([data[2], data[3]]);
@@ -228,16 +227,6 @@ impl<'a> CdrDecoder<'a> {
 
     pub fn read_u64(&mut self) -> Result<u64, String> {
         self.align_to(size_of::<u64>());
-        // let end = self
-        //     .pos
-        //     .checked_add(size_of::<u64>())
-        //     .ok_or_else(|| "CdrDecoder: read_u64: position overflow.".to_string())?;
-        // if end > self.payload.len() {
-        //     return Err("CdrDecoder: read_u64: not enough bytes in payload.".to_string());
-        // }
-
-        // let bytes = &self.payload[self.pos..end];
-        // self.pos = end;
         let bytes = self.read_bytes_raw(size_of::<u64>())?;
         match self.endianness {
             Endianness::Big => {
@@ -255,16 +244,6 @@ impl<'a> CdrDecoder<'a> {
 
     pub fn read_u32(&mut self) -> Result<u32, String> {
         self.align_to(size_of::<u32>());
-        // let end = self
-        //     .pos
-        //     .checked_add(size_of::<u32>())
-        //     .ok_or_else(|| "CdrDecoder: read_u32: position overflow.".to_string())?;
-        // if end > self.payload.len() {
-        //     return Err("CdrDecoder: read_u32: not enough bytes in payload.".to_string());
-        // }
-
-        // let bytes = &self.payload[self.pos..end];
-        // self.pos = end;
         let bytes = self.read_bytes_raw(size_of::<u32>())?;
         match self.endianness {
             Endianness::Big => {
@@ -282,15 +261,6 @@ impl<'a> CdrDecoder<'a> {
 
     pub fn read_u16(&mut self) -> Result<u16, String> {
         self.align_to(size_of::<u16>());
-        // let end = self
-        //     .pos
-        //     .checked_add(size_of::<u16>())
-        //     .ok_or_else(|| "CdrDecoder: read_u16: position overflow.".to_string())?;
-        // if end > self.payload.len() {
-        //     return Err("CdrDecoder: read_u16: not enough bytes in payload.".to_string());
-        // }
-        // let bytes = &self.payload[self.pos..end];
-        // self.pos = end;
         let bytes = self.read_bytes_raw(size_of::<u16>())?;
 
         match self.endianness {
@@ -308,14 +278,6 @@ impl<'a> CdrDecoder<'a> {
     }
 
     pub fn read_u8(&mut self) -> Result<u8, String> {
-        // let end = self
-        //     .pos
-        //     .checked_add(size_of::<u8>())
-        //     .ok_or_else(|| "CdrDecoder: read_u8: position overflow.".to_string())?;
-        // if end > self.payload.len() {
-        //     return Err("CdrDecoder: read_u8: not enough bytes in payload.".to_string());
-        // }
-        // let bytes = &self.payload[self.pos..end];
         let bytes = self.read_bytes_raw(size_of::<u8>())?;
         match self.endianness {
             Endianness::Big => {
@@ -333,16 +295,6 @@ impl<'a> CdrDecoder<'a> {
 
     pub fn read_i64(&mut self) -> Result<i64, String> {
         self.align_to(size_of::<i64>());
-        // let end = self
-        //     .pos
-        //     .checked_add(size_of::<i64>())
-        //     .ok_or_else(|| "CdrDecoder: read_i64: position overflow.".to_string())?;
-        // if end > self.payload.len() {
-        //     return Err("CdrDecoder: read_i64: not enough bytes in payload.".to_string());
-        // }
-
-        // let bytes = &self.payload[self.pos..end];
-        // self.pos = end;
         let bytes = self.read_bytes_raw(size_of::<i64>())?;
         match self.endianness {
             Endianness::Big => {
@@ -360,16 +312,6 @@ impl<'a> CdrDecoder<'a> {
 
     pub fn read_i32(&mut self) -> Result<i32, String> {
         self.align_to(size_of::<i32>());
-        // let end = self
-        //     .pos
-        //     .checked_add(size_of::<i32>())
-        //     .ok_or_else(|| "CdrDecoder: read_i32: position overflow.".to_string())?;
-        // if end > self.payload.len() {
-        //     return Err("CdrDecoder: read_i32: not enough bytes in payload.".to_string());
-        // }
-
-        // let bytes = &self.payload[self.pos..end];
-        // self.pos = end;
         let bytes = self.read_bytes_raw(size_of::<i32>())?;
         match self.endianness {
             Endianness::Big => {
@@ -387,15 +329,6 @@ impl<'a> CdrDecoder<'a> {
 
     pub fn read_i16(&mut self) -> Result<i16, String> {
         self.align_to(size_of::<i16>());
-        // let end = self
-        //     .pos
-        //     .checked_add(size_of::<i16>())
-        //     .ok_or_else(|| "CdrDecoder: read_i16: position overflow.".to_string())?;
-        // if end > self.payload.len() {
-        //     return Err("CdrDecoder: read_i16: not enough bytes in payload.".to_string());
-        // }
-        // let bytes = &self.payload[self.pos..end];
-        // self.pos = end;
         let bytes = self.read_bytes_raw(size_of::<i16>())?;
         match self.endianness {
             Endianness::Big => {
@@ -412,15 +345,6 @@ impl<'a> CdrDecoder<'a> {
     }
 
     pub fn read_i8(&mut self) -> Result<i8, String> {
-        // let end = self
-        //     .pos
-        //     .checked_add(size_of::<i8>())
-        //     .ok_or_else(|| "CdrDecoder: read_i8: position overflow.".to_string())?;
-        // if end > self.payload.len() {
-        //     return Err("CdrDecoder: read_i8: not enough bytes in payload.".to_string());
-        // }
-        // let bytes = &self.payload[self.pos..end];
-        // self.pos = end;
         let bytes = self.read_bytes_raw(size_of::<i8>())?;
         match self.endianness {
             Endianness::Big => {
@@ -438,15 +362,6 @@ impl<'a> CdrDecoder<'a> {
 
     pub fn read_f64(&mut self) -> Result<f64, String> {
         self.align_to(size_of::<f64>());
-        // let end = self
-        //     .pos
-        //     .checked_add(size_of::<f64>())
-        //     .ok_or_else(|| "CdrDecoder: read_f64: position overflow.".to_string())?;
-        // if end > self.payload.len() {
-        //     return Err("CdrDecoder: read_f64: not enough bytes in payload.".to_string());
-        // }
-        // let bytes = &self.payload[self.pos..end];
-        // self.pos = end;
         let bytes = self.read_bytes_raw(size_of::<f64>())?;
         match self.endianness {
             Endianness::Big => {
@@ -464,15 +379,6 @@ impl<'a> CdrDecoder<'a> {
 
     pub fn read_f32(&mut self) -> Result<f32, String> {
         self.align_to(size_of::<f32>());
-        // let end = self
-        //     .pos
-        //     .checked_add(size_of::<f32>())
-        //     .ok_or_else(|| "CdrDecoder: read_f32: position overflow.".to_string())?;
-        // if end > self.payload.len() {
-        //     return Err("CdrDecoder: read_f32: not enough bytes in payload.".to_string());
-        // }
-        // let bytes = &self.payload[self.pos..end];
-        // self.pos = end;
         let bytes = self.read_bytes_raw(size_of::<f32>())?;
         match self.endianness {
             Endianness::Big => {
@@ -504,7 +410,6 @@ impl<'a> CdrDecoder<'a> {
     where
         T: DecodeCdr,
     {
-        // std::array::try_from_fn(|_| T::decode_cdr(self))
         let mut items = Vec::with_capacity(N);
         for _ in 0..N {
             items.push(T::decode_cdr(self)?);
