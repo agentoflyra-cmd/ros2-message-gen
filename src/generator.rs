@@ -10,11 +10,11 @@ use super::parser::{Constant, MessageType, parse_fields_and_constants};
 const CDR_RUNTIME_SOURCE: &str = include_str!("cdr.rs");
 const DISPATCH_CRATE_NAME: &str = "ros2-dispatch";
 const RUST_KEYWORDS: &[&str] = &[
-    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
-    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
-    "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
-    "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
-    "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
+    "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
+    "while", "async", "await", "dyn", "abstract", "become", "box", "do", "final", "macro",
+    "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
 ];
 
 /// 消息生成配置
@@ -95,7 +95,10 @@ fn add_consts_to_impl(imp: &mut Impl, consts: &[Constant]) {
 fn format_constant(constant: &Constant) -> (&str, String) {
     let ty = constant.const_type.as_str();
     if ty == "std::string::String" {
-        ("&'static str", format!("\"{}\"", escape_rust_string(&constant.value)))
+        (
+            "&'static str",
+            format!("\"{}\"", escape_rust_string(&constant.value)),
+        )
     } else {
         (ty, constant.value.clone())
     }
@@ -378,7 +381,8 @@ impl MessageGenerator {
         let src_dir = dispatch_dir.join("src");
         fs::create_dir_all(&src_dir)?;
 
-        let mut package_names: Vec<&str> = messages.iter().map(|msg| msg.package.as_str()).collect();
+        let mut package_names: Vec<&str> =
+            messages.iter().map(|msg| msg.package.as_str()).collect();
         for (request, response) in services {
             package_names.push(request.package.as_str());
             package_names.push(response.package.as_str());
@@ -551,6 +555,7 @@ fn dispatch_manifest(packages: &[&str]) -> String {
     content.push_str("version = \"0.1.0\"\n");
     content.push_str("edition = \"2024\"\n\n");
     content.push_str("[dependencies]\n");
+    content.push_str("cdr-runtime = { path = \"../cdr-runtime\" }\n");
     for package in packages {
         content.push_str(&format!("{package} = {{ path = \"../{package}\" }}\n"));
     }
@@ -639,7 +644,7 @@ fn generate_decode_module(
     let mut content = String::new();
     content.push_str("#[allow(unused_imports)]\n");
     content.push_str(
-        "pub use cdr_runtime::{decode_from_bytes, CdrDecoder, DecodeCdr, Endianness, WChar16, WChar32};\n",
+        "pub use cdr_runtime::{decode_from_bytes, CdrDecoder, CdrError, CdrResult, DecodeCdr, Endianness, WChar16, WChar32};\n",
     );
     content.push_str("#[allow(unused_imports)]\n");
     content.push_str("use crate::msg::*;\n");
@@ -672,7 +677,7 @@ fn generate_encode_module(
     content.push_str("use crate::srv::*;\n");
     content.push_str("#[allow(unused_imports)]\n");
     content.push_str(
-        "pub use cdr_runtime::{encode_to_vec, CdrEncoder, EncodeCdr, Endianness, WChar16, WChar32};\n\n",
+        "pub use cdr_runtime::{encode_to_vec, CdrEncoder, CdrError, CdrResult, EncodeCdr, Endianness, WChar16, WChar32};\n\n",
     );
     content.push_str(&scope.to_string());
     content
@@ -690,8 +695,9 @@ fn generate_dispatch_module(
 
     if entries.is_empty() {
         content.push_str("pub enum DecodedMessage {}\n\n");
-        content.push_str("pub fn decode_message_by_schema(schema_name: &str, _data: &[u8]) -> Result<DecodedMessage, std::string::String> {\n");
-        content.push_str("    Err(format!(\"unknown schema: {schema_name}\"))\n");
+        content.push_str("pub fn decode_message_by_schema(schema_name: &str, _data: &[u8]) -> cdr_runtime::CdrResult<DecodedMessage> {\n");
+        content
+            .push_str("    Err(cdr_runtime::CdrError::UnknownSchema(schema_name.to_string()))\n");
         content.push_str("}\n");
         return content;
     }
@@ -701,8 +707,7 @@ fn generate_dispatch_module(
     for entry in &entries {
         content.push_str(&format!(
             "    {}({}),\n",
-            entry.variant_name,
-            entry.type_path
+            entry.variant_name, entry.type_path
         ));
     }
     content.push_str("}\n\n");
@@ -713,14 +718,13 @@ fn generate_dispatch_module(
     for entry in &entries {
         content.push_str(&format!(
             "            Self::{}(_) => \"{}\",\n",
-            entry.variant_name,
-            entry.schema_name
+            entry.variant_name, entry.schema_name
         ));
     }
     content.push_str("        }\n");
     content.push_str("    }\n");
     content.push_str("\n");
-    content.push_str("    pub fn encode_to_vec(&self) -> Result<Vec<u8>, std::string::String> {\n");
+    content.push_str("    pub fn encode_to_vec(&self) -> cdr_runtime::CdrResult<Vec<u8>> {\n");
     content.push_str("        match self {\n");
     for entry in &entries {
         content.push_str(&format!(
@@ -734,7 +738,7 @@ fn generate_dispatch_module(
     content.push_str("}\n\n");
 
     content.push_str(
-        "pub fn decode_message_by_schema(schema_name: &str, data: &[u8]) -> Result<DecodedMessage, std::string::String> {\n",
+        "pub fn decode_message_by_schema(schema_name: &str, data: &[u8]) -> cdr_runtime::CdrResult<DecodedMessage> {\n",
     );
     content.push_str("    match schema_name {\n");
     for entry in &entries {
@@ -746,7 +750,9 @@ fn generate_dispatch_module(
             ty = entry.type_path,
         ));
     }
-    content.push_str("        _ => Err(format!(\"unknown schema: {schema_name}\")),\n");
+    content.push_str(
+        "        _ => Err(cdr_runtime::CdrError::UnknownSchema(schema_name.to_string())),\n",
+    );
     content.push_str("    }\n");
     content.push_str("}\n");
 
@@ -820,19 +826,11 @@ fn dispatch_service_schema_name(message: &MessageType, suffix: &str) -> String {
 }
 
 fn dispatch_msg_type_path(message: &MessageType, style: StructNameStyle) -> String {
-    format!(
-        "{}::msg::{}",
-        message.package,
-        message.struct_name(style)
-    )
+    format!("{}::msg::{}", message.package, message.struct_name(style))
 }
 
 fn dispatch_srv_type_path(message: &MessageType, style: StructNameStyle) -> String {
-    format!(
-        "{}::srv::{}",
-        message.package,
-        message.struct_name(style)
-    )
+    format!("{}::srv::{}", message.package, message.struct_name(style))
 }
 
 fn dispatch_decode_fn_path(message: &MessageType) -> String {
@@ -861,7 +859,7 @@ fn add_encode_impl(scope: &mut Scope, message: &MessageType, style: StructNameSt
 
 fn configure_decode_function(function: &mut Function, message: &MessageType) {
     function.arg("decoder", "&mut CdrDecoder<'_>");
-    function.ret("Result<Self, std::string::String>");
+    function.ret("CdrResult<Self>");
     function.line("Ok(Self {");
     for field in &message.fields {
         function.line(format!(
@@ -876,7 +874,7 @@ fn configure_decode_function(function: &mut Function, message: &MessageType) {
 fn configure_encode_function(function: &mut Function, message: &MessageType) {
     function.arg_ref_self();
     function.arg("encoder", "&mut CdrEncoder");
-    function.ret("Result<(), String>");
+    function.ret("CdrResult<()>");
     for field in &message.fields {
         function.line(encode_statement(field, &message.package));
     }
@@ -931,9 +929,17 @@ fn encode_statement(field: &super::parser::Field, current_package: &str) -> Stri
     let field_name = rust_identifier(&field.name);
     if field.is_array {
         if field.array_size.is_some() {
-            format!("encoder.write_array::<{}, _>(&self.{})?;", strip_container_type(&base_type), field_name)
+            format!(
+                "encoder.write_array::<{}, _>(&self.{})?;",
+                strip_container_type(&base_type),
+                field_name
+            )
         } else {
-            format!("encoder.write_seq::<{}>(&self.{})?;", strip_vec_type(&base_type), field_name)
+            format!(
+                "encoder.write_seq::<{}>(&self.{})?;",
+                strip_vec_type(&base_type),
+                field_name
+            )
         }
     } else {
         format!(
@@ -1133,7 +1139,7 @@ mod tests {
         )?;
         fs::write(
             app_dir.join("src/main.rs"),
-            "use sensor_msgs::encode::encode_to_vec;\nuse sensor_msgs::msg::Imu;\n\nfn encode(msg: &Imu) -> Result<Vec<u8>, String> {\n    encode_to_vec(msg)\n}\n\nfn main() {\n    let _ = core::mem::size_of::<Imu>();\n    let _ = encode as fn(&Imu) -> Result<Vec<u8>, String>;\n}\n",
+            "use sensor_msgs::encode::{encode_to_vec, CdrResult};\nuse sensor_msgs::msg::Imu;\n\nfn encode(msg: &Imu) -> CdrResult<Vec<u8>> {\n    encode_to_vec(msg)\n}\n\nfn main() {\n    let _ = core::mem::size_of::<Imu>();\n    let _ = encode as fn(&Imu) -> CdrResult<Vec<u8>>;\n}\n",
         )?;
 
         let std_pkg_dir = temp_dir.path().join("std_msgs");
@@ -1175,7 +1181,9 @@ mod tests {
         assert!(sensor_manifest.contains("\"geometry_msgs/serde\""));
         assert!(sensor_manifest.contains("\"std_msgs/serde\""));
         let sensor_encode = fs::read_to_string(output_dir.join("sensor_msgs/src/encode.rs"))?;
-        assert!(sensor_encode.contains("pub use cdr_runtime::{encode_to_vec, CdrEncoder, EncodeCdr"));
+        assert!(sensor_encode.contains(
+            "pub use cdr_runtime::{encode_to_vec, CdrEncoder, CdrError, CdrResult, EncodeCdr"
+        ));
         assert!(sensor_encode.contains("impl EncodeCdr for Imu"));
 
         let status = Command::new("cargo")
@@ -1191,8 +1199,8 @@ mod tests {
     }
 
     #[test]
-    fn generated_dispatch_crate_can_be_imported_from_external_workspace(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn generated_dispatch_crate_can_be_imported_from_external_workspace()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
         let workspace_root = temp_dir.path().join("workspace");
         let app_dir = workspace_root.join("crates/app");
@@ -1207,7 +1215,7 @@ mod tests {
         )?;
         fs::write(
             app_dir.join("src/main.rs"),
-            "use ros2_dispatch::{decode_message_by_schema, DecodedMessage};\n\nfn main() {\n    let _ = core::mem::size_of::<DecodedMessage>();\n    let _ = decode_message_by_schema(\"sensor_msgs/msg/Imu\", &[]);\n    let _ = decode_message_by_schema(\"lifecycle_msgs/srv/ChangeState_Request\", &[]);\n    let _encode: fn(&DecodedMessage) -> Result<Vec<u8>, String> = DecodedMessage::encode_to_vec;\n}\n",
+            "use ros2_dispatch::{decode_message_by_schema, DecodedMessage};\n\nfn main() {\n    let _ = core::mem::size_of::<DecodedMessage>();\n    let _ = decode_message_by_schema(\"sensor_msgs/msg/Imu\", &[]);\n    let _ = decode_message_by_schema(\"lifecycle_msgs/srv/ChangeState_Request\", &[]);\n    let _ = DecodedMessage::encode_to_vec;\n}\n",
         )?;
 
         let std_pkg_dir = temp_dir.path().join("std_msgs");
@@ -1246,7 +1254,10 @@ mod tests {
         let lifecycle_srv_dir = lifecycle_pkg_dir.join("srv");
         fs::create_dir_all(&lifecycle_msg_dir)?;
         fs::create_dir_all(&lifecycle_srv_dir)?;
-        fs::write(lifecycle_msg_dir.join("Transition.msg"), "uint8 id\nstring label\n")?;
+        fs::write(
+            lifecycle_msg_dir.join("Transition.msg"),
+            "uint8 id\nstring label\n",
+        )?;
         fs::write(
             lifecycle_srv_dir.join("ChangeState.srv"),
             "Transition transition\n---\nbool success\n",
@@ -1268,7 +1279,10 @@ mod tests {
         assert!(dispatch_content.contains("lifecycle_msgs/srv/ChangeState_Request"));
         assert!(dispatch_content.contains("pub fn decode_message_by_schema"));
         assert!(dispatch_content.contains("pub fn schema_name(&self) -> &'static str"));
-        assert!(dispatch_content.contains("pub fn encode_to_vec(&self) -> Result<Vec<u8>, std::string::String>"));
+        assert!(
+            dispatch_content
+                .contains("pub fn encode_to_vec(&self) -> cdr_runtime::CdrResult<Vec<u8>>")
+        );
 
         let status = Command::new("cargo")
             .arg("check")
@@ -1345,7 +1359,7 @@ mod tests {
         let decode_content = fs::read_to_string(output_dir.join("std_msgs/src/decode.rs"))?;
         assert!(msg_content.contains("pub struct String"));
         assert!(msg_content.contains("pub data: std::string::String,"));
-        assert!(decode_content.contains("Result<Self, std::string::String>"));
+        assert!(decode_content.contains("CdrResult<Self>"));
 
         Ok(())
     }
@@ -1479,8 +1493,8 @@ mod tests {
     }
 
     #[test]
-    fn struct_name_style_config_is_applied_to_generated_output(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn struct_name_style_config_is_applied_to_generated_output()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
         let pkg_dir = temp_dir.path().join("geometry_msgs");
         let msg_dir = pkg_dir.join("msg");

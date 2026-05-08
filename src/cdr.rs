@@ -1,4 +1,81 @@
 use std::char;
+use std::fmt;
+
+pub type CdrResult<T> = Result<T, CdrError>;
+
+#[derive(Debug)]
+pub enum CdrError {
+    InputTooShort { context: &'static str, min_len: usize, actual_len: usize },
+    LengthOverflow { context: &'static str },
+    NotEnoughBytes { context: &'static str, requested: usize, remaining: usize },
+    OddByteLength { context: &'static str, len: usize },
+    InvalidRepresentation(u16),
+    InvalidUtf8(std::string::FromUtf8Error),
+    InvalidUtf16(std::char::DecodeUtf16Error),
+    InvalidUnicodeScalar { context: &'static str, value: u32 },
+    InvalidBool(u8),
+    NonAsciiChar(char),
+    FixedArrayLength { expected: usize, actual: usize },
+    UnknownSchema(String),
+}
+
+impl fmt::Display for CdrError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InputTooShort {
+                context,
+                min_len,
+                actual_len,
+            } => write!(
+                f,
+                "{context}: input too short, expected at least {min_len} bytes, got {actual_len}"
+            ),
+            Self::LengthOverflow { context } => write!(f, "{context}: length overflow"),
+            Self::NotEnoughBytes {
+                context,
+                requested,
+                remaining,
+            } => write!(
+                f,
+                "{context}: not enough bytes, requested {requested}, remaining {remaining}"
+            ),
+            Self::OddByteLength { context, len } => {
+                write!(f, "{context}: expected an even byte length, got {len}")
+            }
+            Self::InvalidRepresentation(value) => {
+                write!(f, "CdrEncoding::parse: invalid representation value {value:#06x}")
+            }
+            Self::InvalidUtf8(err) => write!(f, "CdrDecoder::read_string: invalid utf8: {err}"),
+            Self::InvalidUtf16(err) => {
+                write!(f, "CdrDecoder::read_wstring: invalid utf16: {err}")
+            }
+            Self::InvalidUnicodeScalar { context, value } => {
+                write!(f, "{context}: invalid unicode scalar value {value:#x}")
+            }
+            Self::InvalidBool(value) => {
+                write!(f, "CdrDecoder::read_bool: invalid boolean discriminant {value}")
+            }
+            Self::NonAsciiChar(value) => {
+                write!(f, "CdrEncoder::write_char: non-ascii char {value:?}")
+            }
+            Self::FixedArrayLength { expected, actual } => write!(
+                f,
+                "CdrDecoder::read_array: failed to build fixed-size array, expected {expected} items, got {actual}"
+            ),
+            Self::UnknownSchema(schema_name) => write!(f, "unknown schema: {schema_name}"),
+        }
+    }
+}
+
+impl std::error::Error for CdrError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidUtf8(err) => Some(err),
+            Self::InvalidUtf16(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 pub enum CdrRepresentation {
     Xcdr1,
@@ -17,7 +94,7 @@ pub struct CdrDecoder<'a> {
 }
 
 pub trait DecodeCdr: Sized {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String>;
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self>;
 }
 
 pub struct CdrEncoder {
@@ -26,7 +103,7 @@ pub struct CdrEncoder {
 }
 
 pub trait EncodeCdr: Sized {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String>;
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +132,13 @@ impl CdrEncoding {
         bytes
     }
 
-    pub fn parse(data: &[u8]) -> Result<(Self, &[u8]), String> {
+    pub fn parse(data: &[u8]) -> CdrResult<(Self, &[u8])> {
         if data.len() < 4 {
-            return Err("CdrEncoding: parse_from: len should be longer than 4".to_string());
+            return Err(CdrError::InputTooShort {
+                context: "CdrEncoding::parse",
+                min_len: 4,
+                actual_len: data.len(),
+            });
         }
 
         let rep = u16::from_be_bytes([data[0], data[1]]);
@@ -92,15 +173,19 @@ impl CdrEncoding {
                 },
                 &data[4..],
             )),
-            _ => Err("CdrEncoding: parse: invalid representaion!".to_string()),
+            _ => Err(CdrError::InvalidRepresentation(rep)),
         }
     }
 }
 
 impl<'a> CdrDecoder<'a> {
-    pub fn new(data: &'a [u8]) -> Result<Self, String> {
+    pub fn new(data: &'a [u8]) -> CdrResult<Self> {
         if data.len() < 4 {
-            return Err("CdrDecoder: new: length of data not enough.".to_string());
+            return Err(CdrError::InputTooShort {
+                context: "CdrDecoder::new",
+                min_len: 4,
+                actual_len: data.len(),
+            });
         }
         let (encoding, payload) = CdrEncoding::parse(data)?;
         Ok(Self {
@@ -116,7 +201,7 @@ impl<'a> CdrDecoder<'a> {
         self.pos += padding_length;
     }
 
-    fn read_bytes_raw(&mut self, length: usize) -> Result<&'a [u8], String> {
+    fn read_bytes_raw(&mut self, length: usize) -> CdrResult<&'a [u8]> {
         if length == 0 {
             return Ok(&[]);
         }
@@ -124,10 +209,16 @@ impl<'a> CdrDecoder<'a> {
         let end = self
             .pos
             .checked_add(length)
-            .ok_or_else(|| "CdrDecoder: read_string: length overflow.".to_string())?;
+            .ok_or(CdrError::LengthOverflow {
+                context: "CdrDecoder::read_bytes_raw",
+            })?;
 
         if end > self.payload.len() {
-            return Err("CdrDecoder: read_string: not enough bytes in payload.".to_string());
+            return Err(CdrError::NotEnoughBytes {
+                context: "CdrDecoder::read_bytes_raw",
+                requested: length,
+                remaining: self.payload.len().saturating_sub(self.pos),
+            });
         }
 
         let bytes = &self.payload[self.pos..end];
@@ -135,17 +226,17 @@ impl<'a> CdrDecoder<'a> {
         Ok(bytes)
     }
 
-    pub fn read_bytes(&mut self, length: usize) -> Result<Vec<u8>, String> {
+    pub fn read_bytes(&mut self, length: usize) -> CdrResult<Vec<u8>> {
         let bytes = self.read_bytes_raw(length)?;
         Ok(bytes.to_vec())
     }
 
-    pub fn read_octet_seq(&mut self) -> Result<Vec<u8>, String> {
+    pub fn read_octet_seq(&mut self) -> CdrResult<Vec<u8>> {
         let length = self.read_u32()?;
         self.read_bytes(length as usize)
     }
 
-    pub fn read_string(&mut self) -> Result<String, String> {
+    pub fn read_string(&mut self) -> CdrResult<String> {
         let length = self.read_u32()?;
         let length = length as usize;
 
@@ -160,32 +251,37 @@ impl<'a> CdrDecoder<'a> {
             bytes
         };
 
-        String::from_utf8(bytes.to_vec())
-            .map_err(|_| "CdrDecoder: read_string: invalid utf8 bytes.".to_string())
+        String::from_utf8(bytes.to_vec()).map_err(CdrError::InvalidUtf8)
     }
 
-    pub fn read_char(&mut self) -> Result<char, String> {
+    pub fn read_char(&mut self) -> CdrResult<char> {
         let u8_unit = self.read_u8()?;
         Ok(u8_unit as char)
     }
 
-    pub fn read_wchar_u16(&mut self) -> Result<char, String> {
+    pub fn read_wchar_u16(&mut self) -> CdrResult<char> {
         let u16_unit = self.read_u16()? as u32;
-        char::from_u32(u16_unit)
-            .ok_or_else(|| "CdrDecoder: read_wchar_u16: invalid unicode scalar value.".to_string())
+        char::from_u32(u16_unit).ok_or(CdrError::InvalidUnicodeScalar {
+            context: "CdrDecoder::read_wchar_u16",
+            value: u16_unit,
+        })
     }
 
-    pub fn read_wchar_u32(&mut self) -> Result<char, String> {
+    pub fn read_wchar_u32(&mut self) -> CdrResult<char> {
         let u32_unit = self.read_u32()?;
-        char::from_u32(u32_unit)
-            .ok_or_else(|| "CdrDecoder: read_wchar_u32: invalid unicode scalar value.".to_string())
+        char::from_u32(u32_unit).ok_or(CdrError::InvalidUnicodeScalar {
+            context: "CdrDecoder::read_wchar_u32",
+            value: u32_unit,
+        })
     }
 
-    pub fn read_wstring(&mut self) -> Result<String, String> {
+    pub fn read_wstring(&mut self) -> CdrResult<String> {
         let code_unit_length = self.read_u32()? as usize;
         let length = code_unit_length
             .checked_mul(2)
-            .ok_or_else(|| "CdrDecoder: read_wstring: length overflow.".to_string())?;
+            .ok_or(CdrError::LengthOverflow {
+                context: "CdrDecoder::read_wstring",
+            })?;
 
         let bytes = self.read_bytes_raw(length)?;
 
@@ -196,7 +292,10 @@ impl<'a> CdrDecoder<'a> {
         };
 
         if bytes.len() % 2 != 0 {
-            return Err("CdrDecoder: read_wstring: odd byte length.".to_string());
+            return Err(CdrError::OddByteLength {
+                context: "CdrDecoder::read_wstring",
+                len: bytes.len(),
+            });
         }
 
         let mut utf16_units = Vec::with_capacity(bytes.len() / 2);
@@ -208,24 +307,22 @@ impl<'a> CdrDecoder<'a> {
             utf16_units.push(unit);
         }
         char::decode_utf16(utf16_units)
-            .map(|r| {
-                r.map_err(|_| "CdrDecoder: read_wstring: cannot decode utf16 units.".to_string())
-            })
+            .map(|r| r.map_err(CdrError::InvalidUtf16))
             .collect()
     }
 
-    pub fn read_bool(&mut self) -> Result<bool, String> {
+    pub fn read_bool(&mut self) -> CdrResult<bool> {
         let raw = self.read_u8()?;
         if raw == 0 {
             Ok(false)
         } else if raw == 1 {
             Ok(true)
         } else {
-            Err("CdrDecoder: read_bool: invalid number, should be 0 or 1.".to_string())
+            Err(CdrError::InvalidBool(raw))
         }
     }
 
-    pub fn read_u64(&mut self) -> Result<u64, String> {
+    pub fn read_u64(&mut self) -> CdrResult<u64> {
         self.align_to(size_of::<u64>());
         let bytes = self.read_bytes_raw(size_of::<u64>())?;
         match self.endianness {
@@ -242,7 +339,7 @@ impl<'a> CdrDecoder<'a> {
         }
     }
 
-    pub fn read_u32(&mut self) -> Result<u32, String> {
+    pub fn read_u32(&mut self) -> CdrResult<u32> {
         self.align_to(size_of::<u32>());
         let bytes = self.read_bytes_raw(size_of::<u32>())?;
         match self.endianness {
@@ -259,7 +356,7 @@ impl<'a> CdrDecoder<'a> {
         }
     }
 
-    pub fn read_u16(&mut self) -> Result<u16, String> {
+    pub fn read_u16(&mut self) -> CdrResult<u16> {
         self.align_to(size_of::<u16>());
         let bytes = self.read_bytes_raw(size_of::<u16>())?;
 
@@ -277,7 +374,7 @@ impl<'a> CdrDecoder<'a> {
         }
     }
 
-    pub fn read_u8(&mut self) -> Result<u8, String> {
+    pub fn read_u8(&mut self) -> CdrResult<u8> {
         let bytes = self.read_bytes_raw(size_of::<u8>())?;
         match self.endianness {
             Endianness::Big => {
@@ -293,7 +390,7 @@ impl<'a> CdrDecoder<'a> {
         }
     }
 
-    pub fn read_i64(&mut self) -> Result<i64, String> {
+    pub fn read_i64(&mut self) -> CdrResult<i64> {
         self.align_to(size_of::<i64>());
         let bytes = self.read_bytes_raw(size_of::<i64>())?;
         match self.endianness {
@@ -310,7 +407,7 @@ impl<'a> CdrDecoder<'a> {
         }
     }
 
-    pub fn read_i32(&mut self) -> Result<i32, String> {
+    pub fn read_i32(&mut self) -> CdrResult<i32> {
         self.align_to(size_of::<i32>());
         let bytes = self.read_bytes_raw(size_of::<i32>())?;
         match self.endianness {
@@ -327,7 +424,7 @@ impl<'a> CdrDecoder<'a> {
         }
     }
 
-    pub fn read_i16(&mut self) -> Result<i16, String> {
+    pub fn read_i16(&mut self) -> CdrResult<i16> {
         self.align_to(size_of::<i16>());
         let bytes = self.read_bytes_raw(size_of::<i16>())?;
         match self.endianness {
@@ -344,7 +441,7 @@ impl<'a> CdrDecoder<'a> {
         }
     }
 
-    pub fn read_i8(&mut self) -> Result<i8, String> {
+    pub fn read_i8(&mut self) -> CdrResult<i8> {
         let bytes = self.read_bytes_raw(size_of::<i8>())?;
         match self.endianness {
             Endianness::Big => {
@@ -360,7 +457,7 @@ impl<'a> CdrDecoder<'a> {
         }
     }
 
-    pub fn read_f64(&mut self) -> Result<f64, String> {
+    pub fn read_f64(&mut self) -> CdrResult<f64> {
         self.align_to(size_of::<f64>());
         let bytes = self.read_bytes_raw(size_of::<f64>())?;
         match self.endianness {
@@ -377,7 +474,7 @@ impl<'a> CdrDecoder<'a> {
         }
     }
 
-    pub fn read_f32(&mut self) -> Result<f32, String> {
+    pub fn read_f32(&mut self) -> CdrResult<f32> {
         self.align_to(size_of::<f32>());
         let bytes = self.read_bytes_raw(size_of::<f32>())?;
         match self.endianness {
@@ -394,7 +491,7 @@ impl<'a> CdrDecoder<'a> {
         }
     }
 
-    pub fn read_seq<T>(&mut self) -> Result<Vec<T>, String>
+    pub fn read_seq<T>(&mut self) -> CdrResult<Vec<T>>
     where
         T: DecodeCdr,
     {
@@ -406,7 +503,7 @@ impl<'a> CdrDecoder<'a> {
         Ok(items)
     }
 
-    pub fn read_array<T, const N: usize>(&mut self) -> Result<[T; N], String>
+    pub fn read_array<T, const N: usize>(&mut self) -> CdrResult<[T; N]>
     where
         T: DecodeCdr,
     {
@@ -416,7 +513,10 @@ impl<'a> CdrDecoder<'a> {
         }
         items
             .try_into()
-            .map_err(|_| "CdrDecoder: read_array: failed to build fixed-size array".to_string())
+            .map_err(|items: Vec<T>| CdrError::FixedArrayLength {
+                expected: N,
+                actual: items.len(),
+            })
     }
 }
 
@@ -467,9 +567,9 @@ impl CdrEncoder {
         self.write_u8(value);
     }
 
-    pub fn write_char(&mut self, value: char) -> Result<(), String> {
+    pub fn write_char(&mut self, value: char) -> CdrResult<()> {
         if !value.is_ascii() {
-            return Err("CdrEncoder: write_char: char is not ascii code.".to_string());
+            return Err(CdrError::NonAsciiChar(value));
         }
         self.write_u8(value as u8);
         Ok(())
@@ -576,7 +676,7 @@ impl CdrEncoder {
         self.write_bytes_raw(value);
     }
 
-    pub fn write_seq<T: EncodeCdr>(&mut self, value: &[T]) -> Result<(), String> {
+    pub fn write_seq<T: EncodeCdr>(&mut self, value: &[T]) -> CdrResult<()> {
         self.write_u32(value.len() as u32);
         for item in value {
             item.encode_cdr(self)?;
@@ -584,7 +684,7 @@ impl CdrEncoder {
         Ok(())
     }
 
-    pub fn write_array<T: EncodeCdr, const N: usize>(&mut self, value: &[T; N]) -> Result<(), String> {
+    pub fn write_array<T: EncodeCdr, const N: usize>(&mut self, value: &[T; N]) -> CdrResult<()> {
         for item in value {
             item.encode_cdr(self)?;
         }
@@ -592,12 +692,12 @@ impl CdrEncoder {
     }
 }
 
-pub fn decode_from_bytes<T: DecodeCdr>(bytes: &[u8]) -> Result<T, String> {
+pub fn decode_from_bytes<T: DecodeCdr>(bytes: &[u8]) -> CdrResult<T> {
     let mut cdr_decoder = CdrDecoder::new(bytes)?;
     T::decode_cdr(&mut cdr_decoder)
 }
 
-pub fn encode_to_vec<T: EncodeCdr>(value: &T) -> Result<Vec<u8>, String> {
+pub fn encode_to_vec<T: EncodeCdr>(value: &T) -> CdrResult<Vec<u8>> {
     let mut encoder = CdrEncoder::new(CdrEncoding {
         cdr_representation: CdrRepresentation::Xcdr1,
         endianness: Endianness::Little,
@@ -607,194 +707,194 @@ pub fn encode_to_vec<T: EncodeCdr>(value: &T) -> Result<Vec<u8>, String> {
 }
 
 impl DecodeCdr for bool {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_bool()
     }
 }
 
 impl EncodeCdr for bool {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_bool(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for u8 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_u8()
     }
 }
 
 impl EncodeCdr for u8 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_u8(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for u16 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_u16()
     }
 }
 
 impl EncodeCdr for u16 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_u16(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for u32 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_u32()
     }
 }
 
 impl EncodeCdr for u32 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_u32(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for u64 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_u64()
     }
 }
 
 impl EncodeCdr for u64 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_u64(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for i8 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_i8()
     }
 }
 
 impl EncodeCdr for i8 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_i8(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for i16 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_i16()
     }
 }
 
 impl EncodeCdr for i16 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_i16(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for i32 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_i32()
     }
 }
 
 impl EncodeCdr for i32 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_i32(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for i64 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_i64()
     }
 }
 
 impl EncodeCdr for i64 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_i64(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for f32 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_f32()
     }
 }
 
 impl EncodeCdr for f32 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_f32(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for f64 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_f64()
     }
 }
 
 impl EncodeCdr for f64 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_f64(*self);
         Ok(())
     }
 }
 
 impl DecodeCdr for char {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_char()
     }
 }
 
 impl EncodeCdr for char {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_char(*self)
     }
 }
 
 impl DecodeCdr for String {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_string()
     }
 }
 
 impl EncodeCdr for String {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_string(self);
         Ok(())
     }
 }
 
 impl DecodeCdr for WChar16 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_wchar_u16().map(Self)
     }
 }
 
 impl EncodeCdr for WChar16 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_wchar16(self.0);
         Ok(())
     }
 }
 
 impl DecodeCdr for WChar32 {
-    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> Result<Self, String> {
+    fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_wchar_u32().map(Self)
     }
 }
 
 impl EncodeCdr for WChar32 {
-    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> Result<(), String> {
+    fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_wchar32(self.0);
         Ok(())
     }
