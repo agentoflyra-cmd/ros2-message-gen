@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +9,7 @@ use super::parser::{Constant, MessageType, parse_fields_and_constants};
 
 const CDR_RUNTIME_SOURCE: &str = include_str!("cdr.rs");
 const DISPATCH_CRATE_NAME: &str = "ros2-dispatch";
+const DISPATCH_SCHEMAS_FILE: &str = ".dispatch_schemas.txt";
 const RUST_KEYWORDS: &[&str] = &[
     "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
     "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
@@ -136,7 +137,7 @@ fn generate_borrowed_module(
     for message in messages {
         content.push_str(&borrowed_struct_definition(message, style));
         content.push('\n');
-        content.push_str(&borrowed_to_owned_impl(message, style));
+        content.push_str(&borrowed_to_owned_impl(message, false, style));
         content.push('\n');
         if !message.constants.is_empty() {
             content.push_str(&borrowed_constants_impl(message, style));
@@ -148,7 +149,7 @@ fn generate_borrowed_module(
         for message in [request, response] {
             content.push_str(&borrowed_struct_definition(message, style));
             content.push('\n');
-            content.push_str(&borrowed_to_owned_impl(message, style));
+            content.push_str(&borrowed_to_owned_impl(message, true, style));
             content.push('\n');
             if !message.constants.is_empty() {
                 content.push_str(&borrowed_constants_impl(message, style));
@@ -375,7 +376,7 @@ impl MessageGenerator {
         srv_rs.push_str("#![allow(unused_imports)]\n");
         srv_rs.push_str("#[cfg(feature = \"serde\")]\n");
         srv_rs.push_str("use serde::{Deserialize, Serialize};\n");
-        srv_rs.push_str("use crate::msg::*;\n\n");
+        srv_rs.push_str("pub use crate::msg::*;\n\n");
 
         srv_rs.push_str(generate_srv_module(services, self.config.struct_name_style).as_str());
 
@@ -423,22 +424,50 @@ impl MessageGenerator {
         let src_dir = dispatch_dir.join("src");
         fs::create_dir_all(&src_dir)?;
 
-        let mut package_names: Vec<&str> =
-            messages.iter().map(|msg| msg.package.as_str()).collect();
-        for (request, response) in services {
-            package_names.push(request.package.as_str());
-            package_names.push(response.package.as_str());
-        }
-        package_names.sort_unstable();
-        package_names.dedup();
+        let style = self.config.struct_name_style;
 
+        // 1. Build schema names for the current batch
+        let msg_refs: Vec<&MessageType> = messages.iter().collect();
+        let srv_refs: Vec<(&MessageType, &MessageType)> = services
+            .iter()
+            .map(|(a, b)| (a, b))
+            .collect();
+        let new_names = collect_schema_names(&msg_refs, &srv_refs);
+
+        // 2. Load existing cache (if any); discard if style changed
+        let (cached_style, mut all_names) = load_dispatch_schemas(&dispatch_dir);
+        let cache_compatible = match (cached_style, style) {
+            (Some(cached), sty) => cached == sty,
+            (None, _) => true, // first run
+        };
+
+        if !cache_compatible && !all_names.is_empty() {
+            all_names.clear();
+        }
+
+        // 3. Merge and deduplicate
+        all_names.extend(new_names);
+        let merged_packages = packages_from_schema_names(&all_names);
+
+        // 4. Persist updated cache
+        save_dispatch_schemas(&dispatch_dir, style, &all_names);
+
+        // 5. Rebuild all DispatchEntries from merged schema names
+        let mut all_entries: Vec<DispatchEntry> = all_names
+            .iter()
+            .filter_map(|name| rebuild_entry_from_schema_name(name, style))
+            .collect();
+        all_entries.sort_by(|a, b| a.schema_name.cmp(&b.schema_name));
+
+        // 6. Write Cargo.toml and lib.rs from the merged entries
+        let pkg_slice: Vec<&str> = merged_packages.iter().map(|s| s.as_str()).collect();
         fs::write(
             dispatch_dir.join("Cargo.toml"),
-            dispatch_manifest(&package_names),
+            dispatch_manifest(&pkg_slice),
         )?;
         fs::write(
             src_dir.join("lib.rs"),
-            generate_dispatch_module(messages, services, self.config.struct_name_style),
+            generate_dispatch_module_from_entries(&all_entries),
         )?;
 
         Ok(())
@@ -757,6 +786,7 @@ fn generate_borrow_decode_module(
     content
 }
 
+#[allow(dead_code)]
 fn generate_dispatch_module(
     messages: &[MessageType],
     services: &[(MessageType, MessageType)],
@@ -764,21 +794,32 @@ fn generate_dispatch_module(
 ) -> String {
     let mut entries = dispatch_entries(messages, services, style);
     entries.sort_by(|a, b| a.schema_name.cmp(&b.schema_name));
+    generate_dispatch_module_from_entries(&entries)
+}
 
+/// Generate dispatch module from pre-built DispatchEntry list (used by both
+/// the direct generate_dispatch_module and the cache-based append path).
+fn generate_dispatch_module_from_entries(entries: &[DispatchEntry]) -> String {
     let mut content = String::new();
 
     if entries.is_empty() {
         content.push_str("pub enum DecodedMessage {}\n\n");
+        content.push_str("pub enum DecodedMessageBorrowed<'a> {}\n\n");
         content.push_str("pub fn decode_message_by_schema(schema_name: &str, _data: &[u8]) -> cdr_runtime::CdrResult<DecodedMessage> {\n");
+        content
+            .push_str("    Err(cdr_runtime::CdrError::UnknownSchema(schema_name.to_string()))\n");
+        content.push_str("}\n");
+        content.push_str("pub fn borrow_decode_message_by_schema<'a>(schema_name: &str, _data: &'a [u8]) -> cdr_runtime::CdrResult<DecodedMessageBorrowed<'a>> {\n");
         content
             .push_str("    Err(cdr_runtime::CdrError::UnknownSchema(schema_name.to_string()))\n");
         content.push_str("}\n");
         return content;
     }
 
+    // ---- owned DecodedMessage ----
     content.push_str("#[derive(Clone, Debug)]\n");
     content.push_str("pub enum DecodedMessage {\n");
-    for entry in &entries {
+    for entry in entries {
         content.push_str(&format!(
             "    {}({}),\n",
             entry.variant_name, entry.type_path
@@ -789,7 +830,7 @@ fn generate_dispatch_module(
     content.push_str("impl DecodedMessage {\n");
     content.push_str("    pub fn schema_name(&self) -> &'static str {\n");
     content.push_str("        match self {\n");
-    for entry in &entries {
+    for entry in entries {
         content.push_str(&format!(
             "            Self::{}(_) => \"{}\",\n",
             entry.variant_name, entry.schema_name
@@ -800,7 +841,7 @@ fn generate_dispatch_module(
     content.push('\n');
     content.push_str("    pub fn encode_to_vec(&self) -> cdr_runtime::CdrResult<Vec<u8>> {\n");
     content.push_str("        match self {\n");
-    for entry in &entries {
+    for entry in entries {
         content.push_str(&format!(
             "            Self::{variant}(msg) => {encode_fn}(msg),\n",
             variant = entry.variant_name,
@@ -815,13 +856,42 @@ fn generate_dispatch_module(
         "pub fn decode_message_by_schema(schema_name: &str, data: &[u8]) -> cdr_runtime::CdrResult<DecodedMessage> {\n",
     );
     content.push_str("    match schema_name {\n");
-    for entry in &entries {
+    for entry in entries {
         content.push_str(&format!(
             "        \"{schema}\" => Ok(DecodedMessage::{variant}({decode_fn}::<{ty}>(data)?)),\n",
             schema = entry.schema_name,
             variant = entry.variant_name,
             decode_fn = entry.decode_fn_path,
             ty = entry.type_path,
+        ));
+    }
+    content.push_str(
+        "        _ => Err(cdr_runtime::CdrError::UnknownSchema(schema_name.to_string())),\n",
+    );
+    content.push_str("    }\n");
+    content.push_str("}\n\n");
+
+    // ---- borrowed DecodedMessageBorrowed ----
+    content.push_str("#[derive(Clone, Debug)]\n");
+    content.push_str("pub enum DecodedMessageBorrowed<'a> {\n");
+    for entry in entries {
+        content.push_str(&format!(
+            "    {}({}),\n",
+            entry.variant_name, entry.borrowed_type_path
+        ));
+    }
+    content.push_str("}\n\n");
+
+    content.push_str(
+        "pub fn borrow_decode_message_by_schema<'a>(schema_name: &str, data: &'a [u8]) -> cdr_runtime::CdrResult<DecodedMessageBorrowed<'a>> {\n",
+    );
+    content.push_str("    match schema_name {\n");
+    for entry in entries {
+        content.push_str(&format!(
+            "        \"{schema}\" => Ok(DecodedMessageBorrowed::{variant}({decode_fn}(data)?)),\n",
+            schema = entry.schema_name,
+            variant = entry.variant_name,
+            decode_fn = entry.borrow_decode_fn_path,
         ));
     }
     content.push_str(
@@ -840,8 +910,11 @@ struct DispatchEntry {
     type_path: String,
     decode_fn_path: String,
     encode_fn_path: String,
+    borrowed_type_path: String,
+    borrow_decode_fn_path: String,
 }
 
+#[allow(dead_code)]
 fn dispatch_entries(
     messages: &[MessageType],
     services: &[(MessageType, MessageType)],
@@ -856,6 +929,8 @@ fn dispatch_entries(
             type_path: dispatch_msg_type_path(message, style),
             decode_fn_path: dispatch_decode_fn_path(message),
             encode_fn_path: dispatch_encode_fn_path(message),
+            borrowed_type_path: format!("{}::borrowed::{}<'a>", message.package, message.struct_name(style)),
+            borrow_decode_fn_path: dispatch_borrow_decode_fn_path(message),
         });
     }
 
@@ -866,6 +941,8 @@ fn dispatch_entries(
             type_path: dispatch_srv_type_path(request, style),
             decode_fn_path: dispatch_decode_fn_path(request),
             encode_fn_path: dispatch_encode_fn_path(request),
+            borrowed_type_path: format!("{}::borrowed::{}<'a>", request.package, request.struct_name(style)),
+            borrow_decode_fn_path: dispatch_borrow_decode_fn_path(request),
         });
         entries.push(DispatchEntry {
             variant_name: dispatch_variant_name(response),
@@ -873,12 +950,15 @@ fn dispatch_entries(
             type_path: dispatch_srv_type_path(response, style),
             decode_fn_path: dispatch_decode_fn_path(response),
             encode_fn_path: dispatch_encode_fn_path(response),
+            borrowed_type_path: format!("{}::borrowed::{}<'a>", response.package, response.struct_name(style)),
+            borrow_decode_fn_path: dispatch_borrow_decode_fn_path(response),
         });
     }
 
     entries
 }
 
+#[allow(dead_code)]
 fn dispatch_variant_name(message: &MessageType) -> String {
     format!(
         "{}{}",
@@ -899,20 +979,163 @@ fn dispatch_service_schema_name(message: &MessageType, suffix: &str) -> String {
     format!("{}/srv/{}_{}", message.package, service_name, suffix)
 }
 
+#[allow(dead_code)]
 fn dispatch_msg_type_path(message: &MessageType, style: StructNameStyle) -> String {
     format!("{}::msg::{}", message.package, message.struct_name(style))
 }
 
+#[allow(dead_code)]
 fn dispatch_srv_type_path(message: &MessageType, style: StructNameStyle) -> String {
     format!("{}::srv::{}", message.package, message.struct_name(style))
 }
 
+#[allow(dead_code)]
 fn dispatch_decode_fn_path(message: &MessageType) -> String {
     format!("{}::decode::decode_from_bytes", message.package)
 }
 
+#[allow(dead_code)]
 fn dispatch_encode_fn_path(message: &MessageType) -> String {
     format!("{}::encode::encode_to_vec", message.package)
+}
+
+#[allow(dead_code)]
+fn dispatch_borrow_decode_fn_path(message: &MessageType) -> String {
+    format!("{}::borrow_decode::borrow_decode_from_bytes", message.package)
+}
+
+/// 从 schema 名称中提取包名、种类(msg/srv)和原始 ROS 类型名
+fn parse_schema_name(schema_name: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = schema_name.splitn(3, '/');
+    let pkg = parts.next()?;
+    let kind = parts.next()?;
+    let type_name = parts.next()?;
+    Some((pkg, kind, type_name))
+}
+
+/// 从 schema 名称重建 DispatchEntry（不依赖 MessageType，只靠 schema 名称和命名风格）
+fn rebuild_entry_from_schema_name(schema_name: &str, style: StructNameStyle) -> Option<DispatchEntry> {
+    let (pkg, _kind, ros_type_name) = parse_schema_name(schema_name)?;
+    // 用 MessageType::struct_name 相同的逻辑计算 struct_name
+    let struct_name = match style {
+        StructNameStyle::CamelCase | StructNameStyle::PascalCase => {
+            let mut out = String::new();
+            let mut cap = true;
+            for ch in ros_type_name.chars() {
+                if ch == '_' {
+                    cap = true;
+                } else if cap {
+                    out.extend(ch.to_uppercase());
+                    cap = false;
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        }
+        StructNameStyle::SnakeCase => ros_type_name.to_string(),
+    };
+    // variant_name 始终用 CamelCase
+    let camel_struct = {
+        let mut out = String::new();
+        let mut cap = true;
+        for ch in ros_type_name.chars() {
+            if ch == '_' {
+                cap = true;
+            } else if cap {
+                out.extend(ch.to_uppercase());
+                cap = false;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    };
+    let camel_pkg = snake_to_camel(pkg);
+    let kind = _kind; // "msg" or "srv"
+
+    Some(DispatchEntry {
+        variant_name: format!("{}{}", camel_pkg, camel_struct),
+        schema_name: schema_name.to_string(),
+        type_path: format!("{}::{}::{}", pkg, kind, struct_name),
+        decode_fn_path: format!("{}::decode::decode_from_bytes", pkg),
+        encode_fn_path: format!("{}::encode::encode_to_vec", pkg),
+        borrowed_type_path: format!("{}::borrowed::{}<'a>", pkg, struct_name),
+        borrow_decode_fn_path: format!("{}::borrow_decode::borrow_decode_from_bytes", pkg),
+    })
+}
+
+/// 收集当前批次所有 schema 名称（去重）
+fn collect_schema_names(
+    messages: &[&MessageType],
+    services: &[(&MessageType, &MessageType)],
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for msg in messages {
+        names.insert(dispatch_message_schema_name(msg));
+    }
+    for (req, resp) in services {
+        names.insert(dispatch_service_schema_name(req, "Request"));
+        names.insert(dispatch_service_schema_name(resp, "Response"));
+    }
+    names
+}
+
+/// 从已有 schema 名称列表推导出所有需要依赖的包名（去重）
+fn packages_from_schema_names(names: &BTreeSet<String>) -> Vec<String> {
+    let mut pkgs: Vec<String> = names
+        .iter()
+        .filter_map(|s| s.split('/').next().map(String::from))
+        .collect();
+    pkgs.sort_unstable();
+    pkgs.dedup();
+    pkgs
+}
+
+/// 加载已有的 dispatch schema 缓存文件（如果存在）
+fn load_dispatch_schemas(dispatch_dir: &Path) -> (Option<StructNameStyle>, BTreeSet<String>) {
+    let path = dispatch_dir.join(DISPATCH_SCHEMAS_FILE);
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return (None, BTreeSet::new()),
+    };
+    let mut lines = content.lines();
+    let style = lines.next().and_then(|l| {
+        if let Some(val) = l.strip_prefix("style=") {
+            match val {
+                "CamelCase" => Some(StructNameStyle::CamelCase),
+                "SnakeCase" => Some(StructNameStyle::SnakeCase),
+                "PascalCase" => Some(StructNameStyle::PascalCase),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    });
+    let names: BTreeSet<String> = lines
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    (style, names)
+}
+
+/// 保存 dispatch schema 缓存文件
+fn save_dispatch_schemas(dispatch_dir: &Path, style: StructNameStyle, names: &BTreeSet<String>) {
+    let path = dispatch_dir.join(DISPATCH_SCHEMAS_FILE);
+    let style_line = format!(
+        "style={}\n",
+        match style {
+            StructNameStyle::CamelCase => "CamelCase",
+            StructNameStyle::SnakeCase => "SnakeCase",
+            StructNameStyle::PascalCase => "PascalCase",
+        }
+    );
+    let mut content = String::from(&style_line);
+    for name in names {
+        content.push_str(name);
+        content.push('\n');
+    }
+    let _ = fs::write(&path, content);
 }
 
 fn add_decode_impl(scope: &mut Scope, message: &MessageType, style: StructNameStyle) {
@@ -934,6 +1157,9 @@ fn add_encode_impl(scope: &mut Scope, message: &MessageType, style: StructNameSt
 fn configure_decode_function(function: &mut Function, message: &MessageType) {
     function.arg("decoder", "&mut CdrDecoder<'_>");
     function.ret("CdrResult<Self>");
+    if message.fields.is_empty() {
+        function.line("let _ = decoder;");
+    }
     function.line("Ok(Self {");
     for field in &message.fields {
         function.line(format!(
@@ -1077,6 +1303,13 @@ fn borrow_decode_expression(
             if let Some(method) = primitive_array_decode_method(field) {
                 return format!("decoder.{method}::<{}>()?", size);
             }
+            if array_element_uses_borrowed_decode(field) {
+                return format!(
+                    "decoder.read_borrow_array::<{}, {}>()?",
+                    borrowed_array_item_type(field, current_package, style),
+                    size
+                );
+            }
             return format!(
                 "decoder.read_array::<{}, {}>()?",
                 strip_container_type(&base_type),
@@ -1085,6 +1318,12 @@ fn borrow_decode_expression(
         }
         if let Some(method) = primitive_seq_decode_method(field) {
             return format!("decoder.{method}()?");
+        }
+        if array_element_uses_borrowed_decode(field) {
+            return format!(
+                "decoder.read_borrow_seq::<{}>()?",
+                borrowed_array_item_type(field, current_package, style)
+            );
         }
         return format!("decoder.read_seq::<{}>()?", strip_vec_type(&base_type));
     }
@@ -1207,13 +1446,9 @@ fn borrowed_struct_definition(message: &MessageType, style: StructNameStyle) -> 
     content
 }
 
-fn borrowed_to_owned_impl(message: &MessageType, style: StructNameStyle) -> String {
+fn borrowed_to_owned_impl(message: &MessageType, is_service: bool, style: StructNameStyle) -> String {
     let struct_name = message.struct_name(style);
-    let target_module = if message.name.ends_with("Request") || message.name.ends_with("Response") {
-        "srv"
-    } else {
-        "msg"
-    };
+    let target_module = if is_service { "srv" } else { "msg" };
     let mut content = String::new();
     content.push_str(&format!("impl<'a> {}<'a> {{\n", struct_name));
     content.push_str(&format!(
@@ -1273,6 +1508,13 @@ fn borrowed_field_type(
                 primitive_sequence_value_type(field, current_package)
             );
         }
+        if array_element_uses_borrowed_decode(field) {
+            let element_type = borrowed_array_item_type(field, current_package, style);
+            if let Some(size) = field.array_size {
+                return format!("[{}; {}]", element_type, size);
+            }
+            return format!("Vec<{}>", element_type);
+        }
         return field.rust_type(current_package);
     }
 
@@ -1304,6 +1546,27 @@ fn borrowed_non_array_type(
     format!("{}<'a>", struct_name)
 }
 
+fn borrowed_array_item_type(
+    field: &super::parser::Field,
+    current_package: &str,
+    style: StructNameStyle,
+) -> String {
+    let owned_type = if field.array_size.is_some() {
+        strip_container_type(&field.rust_type(current_package)).to_string()
+    } else {
+        strip_vec_type(&field.rust_type(current_package)).to_string()
+    };
+    if owned_type.contains("::msg::") {
+        return format!("{}<'a>", owned_type.replacen("::msg::", "::borrowed::", 1));
+    }
+    if owned_type.contains("::srv::") {
+        return format!("{}<'a>", owned_type.replacen("::srv::", "::borrowed::", 1));
+    }
+
+    let struct_name = field_type_struct_name(&field.field_type, style);
+    format!("{}<'a>", struct_name)
+}
+
 fn field_type_struct_name(field_type: &str, style: StructNameStyle) -> String {
     let ty = field_type.rsplit('/').next().unwrap_or(field_type);
     match style {
@@ -1313,9 +1576,6 @@ fn field_type_struct_name(field_type: &str, style: StructNameStyle) -> String {
 }
 
 fn is_borrowed_nested_field(field: &super::parser::Field) -> bool {
-    if field.is_array {
-        return false;
-    }
     !matches!(
         field.field_type.as_str(),
         "bool"
@@ -1336,6 +1596,31 @@ fn is_borrowed_nested_field(field: &super::parser::Field) -> bool {
     )
 }
 
+fn array_element_uses_borrowed_decode(field: &super::parser::Field) -> bool {
+    field.is_array
+        && !is_dynamic_byte_sequence(field)
+        && !is_borrowed_primitive_sequence(field)
+        && !is_borrowed_primitive_array(field)
+        && !matches!(
+            field.field_type.as_str(),
+            "bool"
+                | "byte"
+                | "char"
+                | "float32"
+                | "float64"
+                | "int8"
+                | "uint8"
+                | "int16"
+                | "uint16"
+                | "int32"
+                | "uint32"
+                | "int64"
+                | "uint64"
+                | "string"
+                | "wstring"
+        )
+}
+
 fn borrowed_to_owned_expression(field: &super::parser::Field) -> String {
     let field_name = rust_identifier(&field.name);
     if field.is_array && is_dynamic_byte_sequence(field) {
@@ -1346,6 +1631,12 @@ fn borrowed_to_owned_expression(field: &super::parser::Field) -> String {
     }
     if is_borrowed_primitive_sequence(field) {
         return format!("self.{field_name}.to_vec()");
+    }
+    if array_element_uses_borrowed_decode(field) {
+        if field.array_size.is_some() {
+            return format!("self.{field_name}.each_ref().map(|item| item.to_owned())");
+        }
+        return format!("self.{field_name}.iter().map(|item| item.to_owned()).collect()");
     }
     if !field.is_array && field.field_type == "string" {
         return format!("self.{field_name}.to_string()");
@@ -1362,6 +1653,7 @@ fn message_uses_borrowed_lifetime(message: &MessageType) -> bool {
             || is_dynamic_byte_sequence(field)
             || is_borrowed_primitive_array(field)
             || is_borrowed_primitive_sequence(field)
+            || array_element_uses_borrowed_decode(field)
     })
 }
 
@@ -1404,6 +1696,9 @@ fn borrow_decode_impl(message: &MessageType, style: StructNameStyle) -> String {
     ));
     content
         .push_str("    fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {\n");
+    if message.fields.is_empty() {
+        content.push_str("        let _ = decoder;\n");
+    }
     content.push_str("        Ok(Self {\n");
     for field in &message.fields {
         content.push_str(&format!(
@@ -1673,7 +1968,7 @@ mod tests {
         )?;
         fs::write(
             app_dir.join("src/main.rs"),
-            "use ros2_dispatch::{decode_message_by_schema, DecodedMessage};\n\nfn main() {\n    let _ = core::mem::size_of::<DecodedMessage>();\n    let _ = decode_message_by_schema(\"sensor_msgs/msg/Imu\", &[]);\n    let _ = decode_message_by_schema(\"lifecycle_msgs/srv/ChangeState_Request\", &[]);\n    let _ = DecodedMessage::encode_to_vec;\n}\n",
+            "use ros2_dispatch::{decode_message_by_schema, borrow_decode_message_by_schema, DecodedMessage, DecodedMessageBorrowed};\n\nfn main() {\n    let _ = core::mem::size_of::<DecodedMessage>();\n    let _ = core::mem::size_of::<DecodedMessageBorrowed>();\n    let _ = decode_message_by_schema(\"sensor_msgs/msg/Imu\", &[]);\n    let _ = borrow_decode_message_by_schema(\"sensor_msgs/msg/Imu\", &[]);\n    let _ = decode_message_by_schema(\"lifecycle_msgs/srv/ChangeState_Request\", &[]);\n    let _ = borrow_decode_message_by_schema(\"lifecycle_msgs/srv/ChangeState_Request\", &[]);\n    let _ = DecodedMessage::encode_to_vec;\n}\n",
         )?;
 
         let std_pkg_dir = temp_dir.path().join("std_msgs");
@@ -1732,6 +2027,7 @@ mod tests {
         assert!(dispatch_manifest.contains("lifecycle_msgs = { path = \"../lifecycle_msgs\" }"));
 
         let dispatch_content = fs::read_to_string(output_dir.join("ros2-dispatch/src/lib.rs"))?;
+        // Owned dispatch
         assert!(dispatch_content.contains("pub enum DecodedMessage"));
         assert!(dispatch_content.contains("sensor_msgs/msg/Imu"));
         assert!(dispatch_content.contains("lifecycle_msgs/srv/ChangeState_Request"));
@@ -1741,6 +2037,10 @@ mod tests {
             dispatch_content
                 .contains("pub fn encode_to_vec(&self) -> cdr_runtime::CdrResult<Vec<u8>>")
         );
+        // Borrowed dispatch
+        assert!(dispatch_content.contains("pub enum DecodedMessageBorrowed<'a>"));
+        assert!(dispatch_content.contains("pub fn borrow_decode_message_by_schema<'a>"));
+        assert!(dispatch_content.contains("std_msgs::borrowed::Header<'a>"));
 
         let status = Command::new("cargo")
             .arg("check")
@@ -1751,6 +2051,39 @@ mod tests {
             .env("CARGO_TARGET_DIR", workspace_root.join("target"))
             .status()?;
         assert!(status.success());
+
+        // ---- Second run: append mode ----
+        // Create a separate directory with a new package to test append
+        let extra_pkg_dir = temp_dir.path().join("nav_msgs");
+        let extra_msg_dir = extra_pkg_dir.join("msg");
+        fs::create_dir_all(&extra_msg_dir)?;
+        fs::write(
+            extra_msg_dir.join("Path.msg"),
+            "std_msgs/Header header\ngeometry_msgs/PoseStamped[] poses\n",
+        )?;
+
+        // Add nav_msgs dependency to the app
+        fs::write(
+            app_dir.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nros2-dispatch = { path = \"../../ros2_msgs/ros2-dispatch\" }\n",
+        )?;
+
+        // Run generation again with the new directory
+        generator.generate_from_directory(extra_pkg_dir.to_str().ok_or("invalid extra dir")?)?;
+
+        // Verify dispatch crate now also contains nav_msgs entries
+        let dispatch_after = fs::read_to_string(output_dir.join("ros2-dispatch/src/lib.rs"))?;
+        assert!(dispatch_after.contains("nav_msgs/msg/Path"),
+            "append mode: nav_msgs/msg/Path should appear in dispatch after second run");
+        assert!(dispatch_after.contains("sensor_msgs/msg/Imu"),
+            "append mode: existing entries should be preserved");
+        assert!(dispatch_after.contains("lifecycle_msgs/srv/ChangeState_Request"),
+            "append mode: service entries should be preserved");
+
+        // Cargo.toml should now include nav_msgs
+        let dispatch_manifest_after = fs::read_to_string(output_dir.join("ros2-dispatch/Cargo.toml"))?;
+        assert!(dispatch_manifest_after.contains("nav_msgs"),
+            "append mode: nav_msgs dependency should be in Cargo.toml");
 
         Ok(())
     }
