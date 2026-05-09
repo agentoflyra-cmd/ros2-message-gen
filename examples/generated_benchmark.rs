@@ -80,7 +80,7 @@ fn run_encode(iterations: u64, label: &str, message: &Imu, encode_fn: fn(&Imu) -
     let ns_per_iter = elapsed.as_nanos() as f64 / iterations as f64;
     let mib_per_s = total_bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
     println!(
-        "{label},encode,{iterations},{total_bytes},{:.3},{:.3}",
+        "generated,{label},encode,{iterations},{total_bytes},{:.3},{:.3}",
         ns_per_iter, mib_per_s
     );
 }
@@ -97,7 +97,7 @@ fn run_decode_owned(iterations: u64, label: &str, bytes: &[u8], decode_fn: fn(&[
     let ns_per_iter = elapsed.as_nanos() as f64 / iterations as f64;
     let mib_per_s = total_bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
     println!(
-        "{label},decode_owned,{iterations},{total_bytes},{:.3},{:.3}",
+        "generated,{label},decode_owned,{iterations},{total_bytes},{:.3},{:.3}",
         ns_per_iter, mib_per_s
     );
 }
@@ -119,7 +119,7 @@ fn run_decode_borrowed(
     let ns_per_iter = elapsed.as_nanos() as f64 / iterations as f64;
     let mib_per_s = total_bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
     println!(
-        "{label},decode_borrowed,{iterations},{total_bytes},{:.3},{:.3}",
+        "generated,{label},decode_borrowed,{iterations},{total_bytes},{:.3},{:.3}",
         ns_per_iter, mib_per_s
     );
 }
@@ -142,7 +142,7 @@ fn run_decode_borrowed_to_owned(
     let ns_per_iter = elapsed.as_nanos() as f64 / iterations as f64;
     let mib_per_s = total_bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
     println!(
-        "{label},decode_borrowed_to_owned,{iterations},{total_bytes},{:.3},{:.3}",
+        "generated,{label},decode_borrowed_to_owned,{iterations},{total_bytes},{:.3},{:.3}",
         ns_per_iter, mib_per_s
     );
 }
@@ -157,9 +157,9 @@ fn main() {
     let little_endian = encode_to_vec(&message).expect("little-endian encode should succeed");
     let big_endian = encode_to_vec_big_endian(&message);
 
-    println!("endianness,operation,iterations,total_bytes,ns_per_iter,mib_per_s");
-    println!("payload_size,little,{}", little_endian.len());
-    println!("payload_size,big,{}", big_endian.len());
+    println!("implementation,endianness,operation,iterations,total_bytes,ns_per_iter,mib_per_s");
+    println!("generated,payload,little,0,{},0,0", little_endian.len());
+    println!("generated,payload,big,0,{},0,0", big_endian.len());
     run_encode(iterations, "little", &message, |msg| {
         encode_to_vec(msg).expect("little-endian encode should succeed")
     });
@@ -183,6 +183,226 @@ fn main() {
         &big_endian,
         borrow_decode_from_bytes_big_endian,
     );
+}
+"#;
+
+const CYCLONE_IDL: &str = r#"module benchmark {
+  module builtin_interfaces {
+    struct Time {
+      long sec;
+      unsigned long nanosec;
+    };
+  };
+
+  module std_msgs {
+    struct Header {
+      benchmark::builtin_interfaces::Time stamp;
+      string frame_id;
+    };
+  };
+
+  module geometry_msgs {
+    struct Quaternion {
+      double x;
+      double y;
+      double z;
+      double w;
+    };
+
+    struct Vector3 {
+      double x;
+      double y;
+      double z;
+    };
+  };
+
+  module sensor_msgs {
+    struct Imu {
+      benchmark::std_msgs::Header header;
+      benchmark::geometry_msgs::Quaternion orientation;
+      double orientation_covariance[9];
+      benchmark::geometry_msgs::Vector3 angular_velocity;
+      double angular_velocity_covariance[9];
+      benchmark::geometry_msgs::Vector3 linear_acceleration;
+      double linear_acceleration_covariance[9];
+      string label;
+      sequence<octet> raw_bytes;
+      sequence<float> samples;
+    };
+  };
+};
+"#;
+
+const CYCLONE_BENCH_C: &str = r#"#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "dds/ddsi/ddsi_cdrstream.h"
+#include "benchmark.h"
+
+static benchmark_sensor_msgs_Imu sample_message(void) {
+  benchmark_sensor_msgs_Imu msg;
+  memset(&msg, 0, sizeof(msg));
+
+  msg.header.stamp.sec = 1717171717;
+  msg.header.stamp.nanosec = 123456789;
+  msg.header.frame_id = strdup("base_linkbase_linkbase_linkbase_link");
+
+  msg.orientation.x = 0.1;
+  msg.orientation.y = 0.2;
+  msg.orientation.z = 0.3;
+  msg.orientation.w = 0.4;
+  for (uint32_t i = 0; i < 9; i++) {
+    msg.orientation_covariance[i] = 0.01;
+    msg.angular_velocity_covariance[i] = 0.02;
+    msg.linear_acceleration_covariance[i] = 0.03;
+  }
+
+  msg.angular_velocity.x = 1.0;
+  msg.angular_velocity.y = 2.0;
+  msg.angular_velocity.z = 3.0;
+  msg.linear_acceleration.x = 4.0;
+  msg.linear_acceleration.y = 5.0;
+  msg.linear_acceleration.z = 6.0;
+
+  msg.label = strdup("imu/frontimu/frontimu/front");
+
+  msg.raw_bytes._length = 2048;
+  msg.raw_bytes._maximum = 2048;
+  msg.raw_bytes._release = true;
+  msg.raw_bytes._buffer = dds_sequence_octet_allocbuf(2048);
+  for (uint32_t i = 0; i < 2048; i++) {
+    msg.raw_bytes._buffer[i] = (uint8_t)(i % 251);
+  }
+
+  msg.samples._length = 512;
+  msg.samples._maximum = 512;
+  msg.samples._release = true;
+  msg.samples._buffer = dds_sequence_float_allocbuf(512);
+  for (uint32_t i = 0; i < 512; i++) {
+    msg.samples._buffer[i] = (float)i * 0.5f;
+  }
+
+  return msg;
+}
+
+static uint64_t now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
+}
+
+static void run_encode(uint64_t iterations, const char *label, const benchmark_sensor_msgs_Imu *message, bool little_endian) {
+  uint64_t started = now_ns();
+  size_t total_bytes = 0;
+  for (uint64_t i = 0; i < iterations; i++) {
+    if (little_endian) {
+      dds_ostreamLE_t os;
+      dds_ostreamLE_init(&os, 8192, 1);
+      dds_stream_writeLE(&os, (const char *) message, benchmark_sensor_msgs_Imu_desc.m_ops);
+      total_bytes += os.x.m_index;
+      dds_ostreamLE_fini(&os);
+    } else {
+      dds_ostreamBE_t os;
+      dds_ostreamBE_init(&os, 8192, 1);
+      dds_stream_writeBE(&os, (const char *) message, benchmark_sensor_msgs_Imu_desc.m_ops);
+      total_bytes += os.x.m_index;
+      dds_ostreamBE_fini(&os);
+    }
+  }
+  uint64_t elapsed = now_ns() - started;
+  double ns_per_iter = (double) elapsed / (double) iterations;
+  double mib_per_s = (double) total_bytes / ((double) elapsed / 1000000000.0) / (1024.0 * 1024.0);
+  printf("cyclonedds,%s,encode,%llu,%zu,%.3f,%.3f\n", label, (unsigned long long) iterations, total_bytes, ns_per_iter, mib_per_s);
+}
+
+static void encode_once(const benchmark_sensor_msgs_Imu *message, bool little_endian, unsigned char **buffer, uint32_t *size) {
+  if (little_endian) {
+    dds_ostreamLE_t os;
+    dds_ostreamLE_init(&os, 8192, 1);
+    dds_stream_writeLE(&os, (const char *) message, benchmark_sensor_msgs_Imu_desc.m_ops);
+    *size = os.x.m_index;
+    *buffer = malloc(*size);
+    memcpy(*buffer, os.x.m_buffer, *size);
+    dds_ostreamLE_fini(&os);
+  } else {
+    dds_ostreamBE_t os;
+    dds_ostreamBE_init(&os, 8192, 1);
+    dds_stream_writeBE(&os, (const char *) message, benchmark_sensor_msgs_Imu_desc.m_ops);
+    *size = os.x.m_index;
+    *buffer = malloc(*size);
+    memcpy(*buffer, os.x.m_buffer, *size);
+    dds_ostreamBE_fini(&os);
+  }
+}
+
+static void run_decode_owned(uint64_t iterations, const char *label, const unsigned char *buffer, uint32_t size, bool needs_normalize) {
+  uint64_t started = now_ns();
+  size_t total_bytes = 0;
+  for (uint64_t i = 0; i < iterations; i++) {
+    benchmark_sensor_msgs_Imu decoded;
+    memset(&decoded, 0, sizeof(decoded));
+    unsigned char *decode_buffer = (unsigned char *) buffer;
+    if (needs_normalize) {
+      decode_buffer = malloc(size);
+      memcpy(decode_buffer, buffer, size);
+      uint32_t off = 0;
+      const uint32_t *normalized = dds_stream_normalize_data(
+        (char *) decode_buffer, &off, size, true, 1, benchmark_sensor_msgs_Imu_desc.m_ops
+      );
+      if (normalized == NULL || off != size) {
+        fprintf(stderr, "cyclonedds normalize failed\n");
+        abort();
+      }
+    }
+    dds_istream_t is;
+    dds_istream_init(&is, size, decode_buffer, 1);
+    dds_stream_read(&is, (char *) &decoded, benchmark_sensor_msgs_Imu_desc.m_ops);
+    total_bytes += size;
+    dds_stream_free_sample(&decoded, benchmark_sensor_msgs_Imu_desc.m_ops);
+    dds_istream_fini(&is);
+    if (needs_normalize) {
+      free(decode_buffer);
+    }
+  }
+  uint64_t elapsed = now_ns() - started;
+  double ns_per_iter = (double) elapsed / (double) iterations;
+  double mib_per_s = (double) total_bytes / ((double) elapsed / 1000000000.0) / (1024.0 * 1024.0);
+  printf("cyclonedds,%s,decode_owned,%llu,%zu,%.3f,%.3f\n", label, (unsigned long long) iterations, total_bytes, ns_per_iter, mib_per_s);
+}
+
+int main(int argc, char **argv) {
+  uint64_t iterations = 20000;
+  if (argc > 1) {
+    iterations = strtoull(argv[1], NULL, 10);
+  }
+
+  benchmark_sensor_msgs_Imu message = sample_message();
+  unsigned char *little = NULL;
+  unsigned char *big = NULL;
+  uint32_t little_size = 0;
+  uint32_t big_size = 0;
+
+  encode_once(&message, true, &little, &little_size);
+  encode_once(&message, false, &big, &big_size);
+
+  printf("cyclonedds,payload,little,0,%u,0,0\n", little_size);
+  printf("cyclonedds,payload,big,0,%u,0,0\n", big_size);
+  run_encode(iterations, "little", &message, true);
+  run_decode_owned(iterations, "little", little, little_size, false);
+  run_encode(iterations, "big", &message, false);
+  run_decode_owned(iterations, "big", big, big_size, true);
+
+  free(little);
+  free(big);
+  benchmark_sensor_msgs_Imu_free(&message, DDS_FREE_CONTENTS);
+  return 0;
 }
 "#;
 
@@ -213,6 +433,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status = run_benchmark_app(&workspace_dir, iterations)?;
     if !status.success() {
         return Err(format!("benchmark app failed with status {status}").into());
+    }
+
+    if let Some(cyclonedds_home) = env::var_os("CYCLONEDDS_HOME") {
+        let cyclone_status =
+            run_cyclonedds_benchmark(&workspace_dir, Path::new(&cyclonedds_home), iterations)?;
+        if !cyclone_status.success() {
+            return Err(format!("cyclonedds benchmark failed with status {cyclone_status}").into());
+        }
     }
 
     Ok(())
@@ -326,4 +554,60 @@ fn run_benchmark_app(
         .env("CARGO_TARGET_DIR", workspace_dir.join("target"));
 
     Ok(command.status()?)
+}
+
+fn run_cyclonedds_benchmark(
+    workspace_dir: &Path,
+    cyclonedds_home: &Path,
+    iterations: u64,
+) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    let cyclone_dir = workspace_dir.join("cyclonedds-bench");
+    let generated_dir = cyclone_dir.join("generated");
+    fs::create_dir_all(&generated_dir)?;
+    fs::write(cyclone_dir.join("benchmark.idl"), CYCLONE_IDL)?;
+    fs::write(cyclone_dir.join("bench.c"), CYCLONE_BENCH_C)?;
+
+    let idlc_status = Command::new(cyclonedds_home.join("bin/idlc"))
+        .arg("-l")
+        .arg("c")
+        .arg("-x")
+        .arg("final")
+        .arg("-o")
+        .arg(&generated_dir)
+        .arg(cyclone_dir.join("benchmark.idl"))
+        .current_dir(&cyclone_dir)
+        .status()?;
+    if !idlc_status.success() {
+        return Err(format!("idlc failed with status {idlc_status}").into());
+    }
+
+    let binary = cyclone_dir.join("cyclone-bench");
+    let lib_dir = cyclonedds_home.join("lib");
+    let include_dir = cyclonedds_home.join("include");
+    let cc_status = Command::new("cc")
+        .arg("-std=gnu11")
+        .arg("-O3")
+        .arg("-pthread")
+        .arg("-I")
+        .arg(&include_dir)
+        .arg("-I")
+        .arg(&generated_dir)
+        .arg(cyclone_dir.join("bench.c"))
+        .arg(generated_dir.join("benchmark.c"))
+        .arg("-L")
+        .arg(&lib_dir)
+        .arg(format!("-Wl,-rpath,{}", lib_dir.display()))
+        .arg("-lddsc")
+        .arg("-o")
+        .arg(&binary)
+        .current_dir(&cyclone_dir)
+        .status()?;
+    if !cc_status.success() {
+        return Err(format!("cc failed with status {cc_status}").into());
+    }
+
+    Ok(Command::new(binary)
+        .arg(iterations.to_string())
+        .current_dir(&cyclone_dir)
+        .status()?)
 }

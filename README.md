@@ -307,6 +307,10 @@ That means:
 For more detail, see [Benchmarking](docs/benchmarking.md) and
 [Performance notes](docs/performance-notes.md).
 
+If `CYCLONEDDS_HOME` points at a local Cyclone DDS install, the same benchmark
+can also emit a direct `generated` vs `cyclonedds` comparison for the equivalent
+message shape using Cyclone's generated C stream ops.
+
 Generated schema dispatch code is emitted in `ros2-dispatch/src/lib.rs`, for example:
 
 ```rust
