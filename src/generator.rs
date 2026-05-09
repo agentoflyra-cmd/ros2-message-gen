@@ -183,10 +183,6 @@ impl MessageGenerator {
         }
     }
 
-    pub fn default() -> Self {
-        Self::new("generated".to_string())
-    }
-
     pub fn with_config(output_path: String, config: GeneratorConfig) -> Self {
         Self {
             output_path,
@@ -227,10 +223,10 @@ impl MessageGenerator {
         let env_vars = ["AMENT_PREFIX_PATH", "CMAKE_PREFIX_PATH", "ROS_PACKAGE_PATH"];
 
         for env_var in &env_vars {
-            if let Ok(value) = std::env::var(env_var) {
-                if !value.is_empty() {
-                    return self.generate_from_env(env_var);
-                }
+            if let Ok(value) = std::env::var(env_var)
+                && !value.is_empty()
+            {
+                return self.generate_from_env(env_var);
             }
         }
 
@@ -449,6 +445,12 @@ impl MessageGenerator {
     }
 }
 
+impl Default for MessageGenerator {
+    fn default() -> Self {
+        Self::new("generated".to_string())
+    }
+}
+
 fn is_generated_service_message(path: &Path) -> bool {
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
         return false;
@@ -519,10 +521,10 @@ fn find_workspace_manifest(root: &Path) -> Option<PathBuf> {
 
     while let Some(dir) = current {
         let manifest = dir.join("Cargo.toml");
-        if let Ok(content) = fs::read_to_string(&manifest) {
-            if content.contains("[workspace]") {
-                return Some(manifest);
-            }
+        if let Ok(content) = fs::read_to_string(&manifest)
+            && content.contains("[workspace]")
+        {
+            return Some(manifest);
         }
         current = dir.parent();
     }
@@ -636,10 +638,10 @@ fn collect_message_dependencies(
 ) {
     for field in &message.fields {
         let rust_type = field.rust_type(current_package);
-        if let Some(package) = rust_type_dependency_package(&rust_type) {
-            if package != current_package {
-                dependencies.push(package.to_string());
-            }
+        if let Some(package) = rust_type_dependency_package(&rust_type)
+            && package != current_package
+        {
+            dependencies.push(package.to_string());
         }
     }
 }
@@ -795,7 +797,7 @@ fn generate_dispatch_module(
     }
     content.push_str("        }\n");
     content.push_str("    }\n");
-    content.push_str("\n");
+    content.push('\n');
     content.push_str("    pub fn encode_to_vec(&self) -> cdr_runtime::CdrResult<Vec<u8>> {\n");
     content.push_str("        match self {\n");
     for entry in &entries {

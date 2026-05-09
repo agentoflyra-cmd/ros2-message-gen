@@ -449,12 +449,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn parse_iterations() -> u64 {
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--iterations" {
-            if let Some(value) = args.next() {
-                if let Ok(iterations) = value.parse::<u64>() {
-                    return iterations;
-                }
-            }
+        if arg == "--iterations"
+            && let Some(value) = args.next()
+            && let Ok(iterations) = value.parse::<u64>()
+        {
+            return iterations;
         }
     }
     20_000
