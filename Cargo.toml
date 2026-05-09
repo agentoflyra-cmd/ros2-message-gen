@@ -1,10 +1,10 @@
 [package]
 name = "ros2-message-gen"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Standalone ROS2 message code generator for Rust"
 license = "MIT"
-# repository = "https://github.com/your-repo/rosbag2hdf5"
+repository = "https://github.com/agentoflyra-cmd/ros2-message-gen"
 authors = ["agentoflyra <agentoflyra@gmail.com>"]
 
 [dependencies]

@@ -26,6 +26,11 @@ This is aimed at workflows such as:
 - SLAM and robotics data pipelines
 - dataset conversion and analysis
 
+## Docs
+
+- [Performance notes](docs/performance-notes.md)
+- [Benchmarking](docs/benchmarking.md)
+
 ## Current Status
 
 This project is still evolving, but the current generator already supports:
@@ -54,6 +59,7 @@ The runtime and output layout may still change, but the current path is:
 - Generate a shared `cdr-runtime` crate
 - Generate a shared `ros2-dispatch` crate with schema-based decode and encode dispatch
 - Generate `decode.rs` with automatic `DecodeCdr` implementations
+- Generate `borrow_decode.rs` with automatic `BorrowDecodeCdr<'a>` implementations
 - Generate `encode.rs` with automatic `EncodeCdr` implementations
 - Configurable naming conventions
 - Standalone binary tool
@@ -108,6 +114,8 @@ generated_ws/
 ├── geometry_msgs
 │   ├── Cargo.toml
 │   └── src
+│       ├── borrow_decode.rs
+│       ├── borrowed.rs
 │       ├── decode.rs
 │       ├── encode.rs
 │       ├── lib.rs
@@ -133,6 +141,10 @@ Notes:
 - Cross-package references are emitted as normal Rust crate paths.
 - `decode.rs` is generated code, not a placeholder. It re-exports runtime items and adds
   `impl DecodeCdr for T` for all generated message and service request/response types.
+- `borrow_decode.rs` is generated alongside `decode.rs`. It provides borrowed decode entrypoints
+  and `impl BorrowDecodeCdr<'a> for T<'a>` for generated borrowed message views.
+- `borrowed.rs` contains borrowed message views plus `to_owned()` conversions back to the
+  normal owned `msg`/`srv` types.
 - `encode.rs` is generated alongside `decode.rs`. It re-exports runtime items and adds
   `impl EncodeCdr for T` for all generated message and service request/response types.
 
@@ -193,6 +205,107 @@ impl EncodeCdr for Imu {
     }
 }
 ```
+
+Generated borrowed decode code is emitted separately in `borrowed.rs` and
+`borrow_decode.rs`, for example:
+
+```rust
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
+pub struct Header<'a> {
+    pub frame_id: &'a str,
+}
+
+impl<'a> Header<'a> {
+    pub fn to_owned(&self) -> crate::msg::Header {
+        crate::msg::Header {
+            frame_id: self.frame_id.to_string(),
+        }
+    }
+}
+
+impl<'a> BorrowDecodeCdr<'a> for Header<'a> {
+    fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
+        Ok(Self {
+            frame_id: decoder.read_str()?,
+        })
+    }
+}
+```
+
+## Borrowed Decode
+
+Borrowed decode is the project's current answer to the original "zerocopy" goal:
+keep lifetimes from the input payload instead of forcing every field to allocate
+immediately.
+
+The generated crates now expose both:
+
+- owned decode via `decode::decode_from_bytes::<T>()`
+- borrowed decode via `borrow_decode::borrow_decode_from_bytes::<T>()`
+
+### Current Borrowed Coverage
+
+Fields that currently decode as borrowed views:
+
+- `string` -> `&'a str`
+- `uint8[]` / `byte[]` -> `&'a [u8]`
+- dynamic primitive sequences such as `float32[]`, `int32[]`, `uint64[]`
+  -> `cdr_runtime::PrimitiveSeq<'a, T>`
+- fixed primitive arrays such as `float64[9]`
+  -> `cdr_runtime::PrimitiveArray<'a, T, N>`
+- nested non-array messages recurse into their borrowed variants
+
+Fields that are still decoded as owned values inside borrowed structs:
+
+- `wstring`
+- non-byte dynamic arrays of complex nested message types
+- fixed arrays of nested message types
+
+### Minimal Borrowed Example
+
+```rust
+use sensor_msgs::borrow_decode::borrow_decode_from_bytes;
+use sensor_msgs::borrowed::Imu as BorrowedImu;
+
+let borrowed = borrow_decode_from_bytes::<BorrowedImu<'_>>(&payload)?;
+
+// borrowed fields
+let frame_id: &str = borrowed.header.frame_id;
+let raw_bytes: &[u8] = borrowed.raw_bytes;
+let samples = borrowed.samples.iter();
+
+// convert back to the normal owned generated type only when needed
+let owned = borrowed.to_owned();
+```
+
+## Performance
+
+The project now has three decode modes in the benchmark harness:
+
+- `decode_owned`
+- `decode_borrowed`
+- `decode_borrowed_to_owned`
+
+On the current benchmark fixture, the latest measured result is:
+
+```text
+little,decode_owned,1000,4492000,199.818,21439.035
+little,decode_borrowed,1000,4492000,84.288,50824.614
+little,decode_borrowed_to_owned,1000,4492000,202.064,21200.734
+big,decode_owned,1000,4492000,270.516,15836.050
+big,decode_borrowed,1000,4492000,92.547,46288.967
+big,decode_borrowed_to_owned,1000,4492000,232.337,18438.325
+```
+
+That means:
+
+- borrowed decode is now materially faster than owned decode
+- borrowed decode followed by `to_owned()` is roughly on par with owned decode for
+  little-endian payloads and faster for the current big-endian fixture
+- the "lifetime-based zerocopy" direction is paying off in measurable terms
+
+For more detail, see [Benchmarking](docs/benchmarking.md) and
+[Performance notes](docs/performance-notes.md).
 
 Generated schema dispatch code is emitted in `ros2-dispatch/src/lib.rs`, for example:
 

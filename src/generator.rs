@@ -126,6 +126,40 @@ fn generate_srv_module(
     scope.to_string()
 }
 
+fn generate_borrowed_module(
+    messages: &[&MessageType],
+    services: &[(&MessageType, &MessageType)],
+    style: StructNameStyle,
+) -> String {
+    let mut content = String::new();
+
+    for message in messages {
+        content.push_str(&borrowed_struct_definition(message, style));
+        content.push('\n');
+        content.push_str(&borrowed_to_owned_impl(message, style));
+        content.push('\n');
+        if !message.constants.is_empty() {
+            content.push_str(&borrowed_constants_impl(message, style));
+            content.push('\n');
+        }
+    }
+
+    for (request, response) in services {
+        for message in [request, response] {
+            content.push_str(&borrowed_struct_definition(message, style));
+            content.push('\n');
+            content.push_str(&borrowed_to_owned_impl(message, style));
+            content.push('\n');
+            if !message.constants.is_empty() {
+                content.push_str(&borrowed_constants_impl(message, style));
+                content.push('\n');
+            }
+        }
+    }
+
+    content
+}
+
 /// 消息生成器
 #[derive(Debug, Clone)]
 pub struct MessageGenerator {
@@ -331,7 +365,7 @@ impl MessageGenerator {
 
         fs::write(
             src_dir.join("lib.rs"),
-            "pub mod decode;\npub mod encode;\npub mod msg;\npub mod srv;\n",
+            "pub mod borrow_decode;\npub mod borrowed;\npub mod decode;\npub mod encode;\npub mod msg;\npub mod srv;\n",
         )?;
 
         let mut msg_rs = String::new();
@@ -349,12 +383,24 @@ impl MessageGenerator {
 
         srv_rs.push_str(generate_srv_module(services, self.config.struct_name_style).as_str());
 
+        let mut borrowed_rs = String::new();
+        borrowed_rs.push_str("#![allow(unused_imports)]\n");
+        borrowed_rs.push_str("use crate::msg::*;\n");
+        borrowed_rs.push_str("use crate::srv::*;\n\n");
+        borrowed_rs.push_str(
+            generate_borrowed_module(messages, services, self.config.struct_name_style).as_str(),
+        );
+
         let decode_rs = generate_decode_module(messages, services, self.config.struct_name_style);
         let encode_rs = generate_encode_module(messages, services, self.config.struct_name_style);
+        let borrow_decode_rs =
+            generate_borrow_decode_module(messages, services, self.config.struct_name_style);
         fs::write(src_dir.join("msg.rs"), msg_rs)?;
         fs::write(src_dir.join("srv.rs"), srv_rs)?;
+        fs::write(src_dir.join("borrowed.rs"), borrowed_rs)?;
         fs::write(src_dir.join("decode.rs"), decode_rs)?;
         fs::write(src_dir.join("encode.rs"), encode_rs)?;
+        fs::write(src_dir.join("borrow_decode.rs"), borrow_decode_rs)?;
 
         Ok(())
     }
@@ -683,6 +729,32 @@ fn generate_encode_module(
     content
 }
 
+fn generate_borrow_decode_module(
+    messages: &[&MessageType],
+    services: &[(&MessageType, &MessageType)],
+    style: StructNameStyle,
+) -> String {
+    let mut content = String::new();
+    content.push_str("#[allow(unused_imports)]\n");
+    content.push_str(
+        "pub use cdr_runtime::{borrow_decode_from_bytes, BorrowDecodeCdr, CdrDecoder, CdrError, CdrResult, DecodeCdr, Endianness, WChar16, WChar32};\n",
+    );
+    content.push_str("#[allow(unused_imports)]\n");
+    content.push_str("use crate::borrowed::*;\n\n");
+    for msg in messages {
+        content.push_str(&borrow_decode_impl(msg, style));
+        content.push('\n');
+    }
+
+    for (request, response) in services {
+        content.push_str(&borrow_decode_impl(request, style));
+        content.push('\n');
+        content.push_str(&borrow_decode_impl(response, style));
+        content.push('\n');
+    }
+    content
+}
+
 fn generate_dispatch_module(
     messages: &[MessageType],
     services: &[(MessageType, MessageType)],
@@ -910,13 +982,25 @@ fn snake_to_camel(name: &str) -> String {
 fn decode_expression(field: &super::parser::Field, current_package: &str) -> String {
     let base_type = field.rust_type(current_package);
     if field.is_array {
+        if is_dynamic_byte_sequence(field) {
+            return "decoder.read_octet_seq()?".to_string();
+        }
         if let Some(size) = field.array_size {
+            if is_fixed_byte_array(field) {
+                return format!("decoder.read_byte_array::<{}>()?", size);
+            }
+            if let Some(method) = primitive_array_decode_method(field) {
+                return format!("decoder.{method}::<{}>()?", size);
+            }
             format!(
                 "decoder.read_array::<{}, {}>()?",
                 strip_container_type(&base_type),
                 size
             )
         } else {
+            if let Some(method) = primitive_seq_decode_method(field) {
+                return format!("decoder.{method}()?");
+            }
             format!("decoder.read_seq::<{}>()?", strip_vec_type(&base_type))
         }
     } else {
@@ -928,13 +1012,25 @@ fn encode_statement(field: &super::parser::Field, current_package: &str) -> Stri
     let base_type = field.rust_type(current_package);
     let field_name = rust_identifier(&field.name);
     if field.is_array {
+        if is_dynamic_byte_sequence(field) {
+            return format!("encoder.write_octet_bytes(&self.{})?;", field_name);
+        }
         if field.array_size.is_some() {
+            if is_fixed_byte_array(field) {
+                return format!("encoder.write_byte_array(&self.{})?;", field_name);
+            }
+            if let Some(method) = primitive_array_encode_method(field) {
+                return format!("encoder.{method}(&self.{})?;", field_name);
+            }
             format!(
                 "encoder.write_array::<{}, _>(&self.{})?;",
                 strip_container_type(&base_type),
                 field_name
             )
         } else {
+            if let Some(method) = primitive_seq_encode_method(field) {
+                return format!("encoder.{method}(&self.{})?;", field_name);
+            }
             format!(
                 "encoder.write_seq::<{}>(&self.{})?;",
                 strip_vec_type(&base_type),
@@ -947,6 +1043,62 @@ fn encode_statement(field: &super::parser::Field, current_package: &str) -> Stri
             base_type, field_name
         )
     }
+}
+
+fn borrow_decode_expression(
+    field: &super::parser::Field,
+    current_package: &str,
+    style: StructNameStyle,
+) -> String {
+    let base_type = field.rust_type(current_package);
+    if field.is_array {
+        if is_dynamic_byte_sequence(field) {
+            return "decoder.read_octet_slice()?".to_string();
+        }
+        if is_borrowed_primitive_sequence(field) {
+            return format!(
+                "decoder.read_primitive_seq_borrowed::<{}>()?",
+                primitive_sequence_value_type(field, current_package)
+            );
+        }
+        if let Some(size) = field.array_size {
+            if is_fixed_byte_array(field) {
+                return format!("decoder.read_byte_array::<{}>()?", size);
+            }
+            if is_borrowed_primitive_array(field) {
+                return format!(
+                    "decoder.read_primitive_array_borrowed::<{}, {}>()?",
+                    primitive_value_type(field, current_package),
+                    size
+                );
+            }
+            if let Some(method) = primitive_array_decode_method(field) {
+                return format!("decoder.{method}::<{}>()?", size);
+            }
+            return format!(
+                "decoder.read_array::<{}, {}>()?",
+                strip_container_type(&base_type),
+                size
+            );
+        }
+        if let Some(method) = primitive_seq_decode_method(field) {
+            return format!("decoder.{method}()?");
+        }
+        return format!("decoder.read_seq::<{}>()?", strip_vec_type(&base_type));
+    }
+
+    if field.field_type == "string" {
+        return "decoder.read_str()?".to_string();
+    }
+
+    if is_borrowed_nested_field(field) {
+        return format!(
+            "<{} as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?",
+            borrowed_non_array_type(field, current_package, style)
+        );
+    }
+
+    format!("<{} as DecodeCdr>::decode_cdr(decoder)?", base_type)
 }
 
 fn strip_vec_type(rust_type: &str) -> &str {
@@ -962,6 +1114,310 @@ fn strip_container_type(rust_type: &str) -> &str {
         .and_then(|inner| inner.split(';').next())
         .map(str::trim)
         .unwrap_or(rust_type)
+}
+
+fn is_dynamic_byte_sequence(field: &super::parser::Field) -> bool {
+    field.is_array && field.array_size.is_none() && matches!(field.field_type.as_str(), "byte" | "uint8")
+}
+
+fn is_fixed_byte_array(field: &super::parser::Field) -> bool {
+    field.is_array && field.array_size.is_some() && matches!(field.field_type.as_str(), "byte" | "uint8")
+}
+
+fn primitive_seq_decode_method(field: &super::parser::Field) -> Option<&'static str> {
+    match field.field_type.as_str() {
+        "uint16" => Some("read_u16_seq"),
+        "uint32" => Some("read_u32_seq"),
+        "uint64" => Some("read_u64_seq"),
+        "int16" => Some("read_i16_seq"),
+        "int32" => Some("read_i32_seq"),
+        "int64" => Some("read_i64_seq"),
+        "float32" => Some("read_f32_seq"),
+        "float64" => Some("read_f64_seq"),
+        _ => None,
+    }
+}
+
+fn primitive_seq_encode_method(field: &super::parser::Field) -> Option<&'static str> {
+    match field.field_type.as_str() {
+        "uint16" => Some("write_u16_seq"),
+        "uint32" => Some("write_u32_seq"),
+        "uint64" => Some("write_u64_seq"),
+        "int16" => Some("write_i16_seq"),
+        "int32" => Some("write_i32_seq"),
+        "int64" => Some("write_i64_seq"),
+        "float32" => Some("write_f32_seq"),
+        "float64" => Some("write_f64_seq"),
+        _ => None,
+    }
+}
+
+fn primitive_array_decode_method(field: &super::parser::Field) -> Option<&'static str> {
+    match field.field_type.as_str() {
+        "uint16" => Some("read_u16_array"),
+        "uint32" => Some("read_u32_array"),
+        "uint64" => Some("read_u64_array"),
+        "int16" => Some("read_i16_array"),
+        "int32" => Some("read_i32_array"),
+        "int64" => Some("read_i64_array"),
+        "float32" => Some("read_f32_array"),
+        "float64" => Some("read_f64_array"),
+        _ => None,
+    }
+}
+
+fn primitive_array_encode_method(field: &super::parser::Field) -> Option<&'static str> {
+    match field.field_type.as_str() {
+        "uint16" => Some("write_u16_array"),
+        "uint32" => Some("write_u32_array"),
+        "uint64" => Some("write_u64_array"),
+        "int16" => Some("write_i16_array"),
+        "int32" => Some("write_i32_array"),
+        "int64" => Some("write_i64_array"),
+        "float32" => Some("write_f32_array"),
+        "float64" => Some("write_f64_array"),
+        _ => None,
+    }
+}
+
+fn borrowed_struct_definition(message: &MessageType, style: StructNameStyle) -> String {
+    let struct_name = message.struct_name(style);
+    let mut content = String::new();
+    content.push_str("#[derive(Clone, Debug, PartialEq, PartialOrd)]\n");
+    content.push_str(&format!("pub struct {}<'a> {{\n", struct_name));
+    for field in &message.fields {
+        content.push_str("    #[allow(missing_docs)]\n");
+        content.push_str(&format!(
+            "    pub {}: {},\n",
+            rust_identifier(&field.name),
+            borrowed_field_type(field, &message.package, style)
+        ));
+    }
+    if !message_uses_borrowed_lifetime(message) {
+        content.push_str("    #[allow(dead_code)]\n");
+        content.push_str("    pub(crate) _phantom: std::marker::PhantomData<&'a ()>,\n");
+    }
+    content.push_str("}\n");
+    content
+}
+
+fn borrowed_to_owned_impl(message: &MessageType, style: StructNameStyle) -> String {
+    let struct_name = message.struct_name(style);
+    let target_module = if message.name.ends_with("Request") || message.name.ends_with("Response") {
+        "srv"
+    } else {
+        "msg"
+    };
+    let mut content = String::new();
+    content.push_str(&format!("impl<'a> {}<'a> {{\n", struct_name));
+    content.push_str(&format!(
+        "    pub fn to_owned(&self) -> crate::{}::{} {{\n",
+        target_module, struct_name
+    ));
+    content.push_str(&format!("        crate::{}::{} {{\n", target_module, struct_name));
+    for field in &message.fields {
+        content.push_str(&format!(
+            "            {}: {},\n",
+            rust_identifier(&field.name),
+            borrowed_to_owned_expression(field)
+        ));
+    }
+    content.push_str("        }\n");
+    content.push_str("    }\n");
+    content.push_str("}\n");
+    content
+}
+
+fn borrowed_constants_impl(message: &MessageType, style: StructNameStyle) -> String {
+    let mut content = String::new();
+    content.push_str(&format!(
+        "impl<'a> {}<'a> {{\n",
+        message.struct_name(style)
+    ));
+    for constant in &message.constants {
+        let (ty, value) = format_constant(constant);
+        content.push_str(&format!(
+            "    pub const {}: {} = {};\n",
+            constant.name, ty, value
+        ));
+    }
+    content.push_str("}\n");
+    content
+}
+
+fn borrowed_field_type(
+    field: &super::parser::Field,
+    current_package: &str,
+    style: StructNameStyle,
+) -> String {
+    if field.is_array {
+        if is_dynamic_byte_sequence(field) {
+            return "&'a [u8]".to_string();
+        }
+        if is_borrowed_primitive_array(field) {
+            return format!(
+                "cdr_runtime::PrimitiveArray<'a, {}, {}>",
+                primitive_value_type(field, current_package),
+                field.array_size.expect("fixed array size should exist")
+            );
+        }
+        if is_borrowed_primitive_sequence(field) {
+            return format!(
+                "cdr_runtime::PrimitiveSeq<'a, {}>",
+                primitive_sequence_value_type(field, current_package)
+            );
+        }
+        return field.rust_type(current_package);
+    }
+
+    if field.field_type == "string" {
+        return "&'a str".to_string();
+    }
+
+    if is_borrowed_nested_field(field) {
+        return borrowed_non_array_type(field, current_package, style);
+    }
+
+    field.rust_type(current_package)
+}
+
+fn borrowed_non_array_type(
+    field: &super::parser::Field,
+    current_package: &str,
+    style: StructNameStyle,
+) -> String {
+    let owned_type = field.rust_type(current_package);
+    if owned_type.contains("::msg::") {
+        return format!(
+            "{}<'a>",
+            owned_type.replacen("::msg::", "::borrowed::", 1)
+        );
+    }
+    if owned_type.contains("::srv::") {
+        return format!(
+            "{}<'a>",
+            owned_type.replacen("::srv::", "::borrowed::", 1)
+        );
+    }
+
+    let struct_name = field_type_struct_name(&field.field_type, style);
+    format!("{}<'a>", struct_name)
+}
+
+fn field_type_struct_name(field_type: &str, style: StructNameStyle) -> String {
+    let ty = field_type.rsplit('/').next().unwrap_or(field_type);
+    match style {
+        StructNameStyle::CamelCase | StructNameStyle::PascalCase => snake_to_camel(ty),
+        StructNameStyle::SnakeCase => ty.to_string(),
+    }
+}
+
+fn is_borrowed_nested_field(field: &super::parser::Field) -> bool {
+    if field.is_array {
+        return false;
+    }
+    !matches!(
+        field.field_type.as_str(),
+        "bool"
+            | "byte"
+            | "char"
+            | "float32"
+            | "float64"
+            | "int8"
+            | "uint8"
+            | "int16"
+            | "uint16"
+            | "int32"
+            | "uint32"
+            | "int64"
+            | "uint64"
+            | "string"
+            | "wstring"
+    )
+}
+
+fn borrowed_to_owned_expression(field: &super::parser::Field) -> String {
+    let field_name = rust_identifier(&field.name);
+    if field.is_array && is_dynamic_byte_sequence(field) {
+        return format!("self.{field_name}.to_vec()");
+    }
+    if is_borrowed_primitive_array(field) {
+        return format!("self.{field_name}.to_array()");
+    }
+    if is_borrowed_primitive_sequence(field) {
+        return format!("self.{field_name}.to_vec()");
+    }
+    if !field.is_array && field.field_type == "string" {
+        return format!("self.{field_name}.to_string()");
+    }
+    if is_borrowed_nested_field(field) {
+        return format!("self.{field_name}.to_owned()");
+    }
+    format!("self.{field_name}.clone()")
+}
+
+fn message_uses_borrowed_lifetime(message: &MessageType) -> bool {
+    message.fields.iter().any(|field| {
+        (!field.is_array && (field.field_type == "string" || is_borrowed_nested_field(field)))
+            || is_dynamic_byte_sequence(field)
+            || is_borrowed_primitive_array(field)
+            || is_borrowed_primitive_sequence(field)
+    })
+}
+
+fn is_borrowed_primitive_sequence(field: &super::parser::Field) -> bool {
+    field.is_array
+        && field.array_size.is_none()
+        && matches!(
+            field.field_type.as_str(),
+            "uint16" | "uint32" | "uint64" | "int16" | "int32" | "int64" | "float32" | "float64"
+        )
+}
+
+fn is_borrowed_primitive_array(field: &super::parser::Field) -> bool {
+    field.is_array
+        && field.array_size.is_some()
+        && matches!(
+            field.field_type.as_str(),
+            "uint16" | "uint32" | "uint64" | "int16" | "int32" | "int64" | "float32" | "float64"
+        )
+}
+
+fn primitive_sequence_value_type(field: &super::parser::Field, current_package: &str) -> String {
+    strip_vec_type(&field.rust_type(current_package)).to_string()
+}
+
+fn primitive_value_type(field: &super::parser::Field, current_package: &str) -> String {
+    if field.array_size.is_some() {
+        strip_container_type(&field.rust_type(current_package)).to_string()
+    } else {
+        strip_vec_type(&field.rust_type(current_package)).to_string()
+    }
+}
+
+fn borrow_decode_impl(message: &MessageType, style: StructNameStyle) -> String {
+    let struct_name = message.struct_name(style);
+    let mut content = String::new();
+    content.push_str(&format!(
+        "impl<'a> BorrowDecodeCdr<'a> for {}<'a> {{\n",
+        struct_name
+    ));
+    content.push_str("    fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {\n");
+    content.push_str("        Ok(Self {\n");
+    for field in &message.fields {
+        content.push_str(&format!(
+            "            {}: {},\n",
+            rust_identifier(&field.name),
+            borrow_decode_expression(field, &message.package, style)
+        ));
+    }
+    if !message_uses_borrowed_lifetime(message) {
+        content.push_str("            _phantom: std::marker::PhantomData,\n");
+    }
+    content.push_str("        })\n");
+    content.push_str("    }\n");
+    content.push_str("}\n");
+    content
 }
 
 fn parse_srv_file(path: &Path) -> Result<(MessageType, MessageType), Box<dyn std::error::Error>> {
@@ -1188,6 +1644,7 @@ mod tests {
 
         let status = Command::new("cargo")
             .arg("check")
+            .arg("--offline")
             .arg("-p")
             .arg("app")
             .current_dir(&workspace_root)
@@ -1286,6 +1743,7 @@ mod tests {
 
         let status = Command::new("cargo")
             .arg("check")
+            .arg("--offline")
             .arg("-p")
             .arg("app")
             .current_dir(&workspace_root)
@@ -1332,6 +1790,7 @@ mod tests {
 
         let status = Command::new("cargo")
             .arg("check")
+            .arg("--offline")
             .arg("-p")
             .arg("app")
             .current_dir(&workspace_root)
@@ -1515,6 +1974,109 @@ mod tests {
         let decode_content = fs::read_to_string(output_dir.join("geometry_msgs/src/decode.rs"))?;
         assert!(msg_content.contains("pub struct robot_status"));
         assert!(decode_content.contains("impl DecodeCdr for robot_status"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn generated_byte_sequences_use_octet_helpers() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let pkg_dir = temp_dir.path().join("example_msgs");
+        let msg_dir = pkg_dir.join("msg");
+        fs::create_dir_all(&msg_dir)?;
+        fs::write(
+            msg_dir.join("Blob.msg"),
+            "uint8[] raw_bytes\nbyte[] more_bytes\nfloat32[] samples\n",
+        )?;
+
+        let output_dir = temp_dir.path().join("generated");
+        let generator = MessageGenerator::new(output_dir.to_string_lossy().to_string());
+        generator.generate_from_directory(temp_dir.path().to_str().ok_or("invalid temp dir")?)?;
+
+        let decode_content = fs::read_to_string(output_dir.join("example_msgs/src/decode.rs"))?;
+        let encode_content = fs::read_to_string(output_dir.join("example_msgs/src/encode.rs"))?;
+        assert!(decode_content.contains("raw_bytes: decoder.read_octet_seq()?,"));
+        assert!(decode_content.contains("more_bytes: decoder.read_octet_seq()?,"));
+        assert!(decode_content.contains("samples: decoder.read_f32_seq()?,"));
+        assert!(encode_content.contains("encoder.write_octet_bytes(&self.raw_bytes)?;"));
+        assert!(encode_content.contains("encoder.write_octet_bytes(&self.more_bytes)?;"));
+        assert!(encode_content.contains("encoder.write_f32_seq(&self.samples)?;"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn generated_primitive_arrays_and_sequences_use_specialized_helpers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let pkg_dir = temp_dir.path().join("example_msgs");
+        let msg_dir = pkg_dir.join("msg");
+        fs::create_dir_all(&msg_dir)?;
+        fs::write(
+            msg_dir.join("Specialized.msg"),
+            concat!(
+                "uint8[16] fixed_bytes\n",
+                "float32[] samples\n",
+                "float64[9] covariance\n",
+                "int32[] ids\n",
+            ),
+        )?;
+
+        let output_dir = temp_dir.path().join("generated");
+        let generator = MessageGenerator::new(output_dir.to_string_lossy().to_string());
+        generator.generate_from_directory(temp_dir.path().to_str().ok_or("invalid temp dir")?)?;
+
+        let decode_content = fs::read_to_string(output_dir.join("example_msgs/src/decode.rs"))?;
+        let encode_content = fs::read_to_string(output_dir.join("example_msgs/src/encode.rs"))?;
+        assert!(decode_content.contains("fixed_bytes: decoder.read_byte_array::<16>()?,"));
+        assert!(decode_content.contains("samples: decoder.read_f32_seq()?,"));
+        assert!(decode_content.contains("covariance: decoder.read_f64_array::<9>()?,"));
+        assert!(decode_content.contains("ids: decoder.read_i32_seq()?,"));
+        assert!(encode_content.contains("encoder.write_byte_array(&self.fixed_bytes)?;"));
+        assert!(encode_content.contains("encoder.write_f32_seq(&self.samples)?;"));
+        assert!(encode_content.contains("encoder.write_f64_array(&self.covariance)?;"));
+        assert!(encode_content.contains("encoder.write_i32_seq(&self.ids)?;"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn generated_borrowed_module_uses_borrowed_fields() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempdir()?;
+        let std_pkg_dir = temp_dir.path().join("std_msgs");
+        let std_msg_dir = std_pkg_dir.join("msg");
+        fs::create_dir_all(&std_msg_dir)?;
+        fs::write(std_msg_dir.join("Header.msg"), "string frame_id\n")?;
+
+        let pkg_dir = temp_dir.path().join("example_msgs");
+        let msg_dir = pkg_dir.join("msg");
+        fs::create_dir_all(&msg_dir)?;
+        fs::write(
+            msg_dir.join("Blob.msg"),
+            "std_msgs/Header header\nstring label\nuint8[] raw_bytes\nfloat32[] samples\nfloat64[9] covariance\n",
+        )?;
+
+        let output_dir = temp_dir.path().join("generated");
+        let generator = MessageGenerator::new(output_dir.to_string_lossy().to_string());
+        generator.generate_from_directory(temp_dir.path().to_str().ok_or("invalid temp dir")?)?;
+
+        let borrowed_content = fs::read_to_string(output_dir.join("example_msgs/src/borrowed.rs"))?;
+        let borrow_decode_content =
+            fs::read_to_string(output_dir.join("example_msgs/src/borrow_decode.rs"))?;
+        assert!(borrowed_content.contains("pub struct Blob<'a>"));
+        assert!(borrowed_content.contains("pub header: std_msgs::borrowed::Header<'a>,"));
+        assert!(borrowed_content.contains("pub label: &'a str,"));
+        assert!(borrowed_content.contains("pub raw_bytes: &'a [u8],"));
+        assert!(borrowed_content.contains("pub samples: cdr_runtime::PrimitiveSeq<'a, f32>,"));
+        assert!(borrowed_content.contains("pub covariance: cdr_runtime::PrimitiveArray<'a, f64, 9>,"));
+        assert!(borrowed_content.contains("pub fn to_owned(&self) -> crate::msg::Blob"));
+        assert!(borrow_decode_content.contains("impl<'a> BorrowDecodeCdr<'a> for Blob<'a>"));
+        assert!(borrow_decode_content.contains("header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,"));
+        assert!(borrow_decode_content.contains("label: decoder.read_str()?,"));
+        assert!(borrow_decode_content.contains("raw_bytes: decoder.read_octet_slice()?,"));
+        assert!(borrow_decode_content.contains("samples: decoder.read_primitive_seq_borrowed::<f32>()?,"));
+        assert!(borrow_decode_content.contains("covariance: decoder.read_primitive_array_borrowed::<f64, 9>()?,"));
 
         Ok(())
     }

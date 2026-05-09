@@ -1,5 +1,7 @@
 use std::char;
 use std::fmt;
+use std::mem::size_of;
+use std::ptr;
 
 pub type CdrResult<T> = Result<T, CdrError>;
 
@@ -11,6 +13,7 @@ pub enum CdrError {
     OddByteLength { context: &'static str, len: usize },
     InvalidRepresentation(u16),
     InvalidUtf8(std::string::FromUtf8Error),
+    InvalidUtf8Slice(std::str::Utf8Error),
     InvalidUtf16(std::char::DecodeUtf16Error),
     InvalidUnicodeScalar { context: &'static str, value: u32 },
     InvalidBool(u8),
@@ -46,6 +49,9 @@ impl fmt::Display for CdrError {
                 write!(f, "CdrEncoding::parse: invalid representation value {value:#06x}")
             }
             Self::InvalidUtf8(err) => write!(f, "CdrDecoder::read_string: invalid utf8: {err}"),
+            Self::InvalidUtf8Slice(err) => {
+                write!(f, "CdrDecoder::read_str: invalid utf8: {err}")
+            }
             Self::InvalidUtf16(err) => {
                 write!(f, "CdrDecoder::read_wstring: invalid utf16: {err}")
             }
@@ -71,17 +77,20 @@ impl std::error::Error for CdrError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidUtf8(err) => Some(err),
+            Self::InvalidUtf8Slice(err) => Some(err),
             Self::InvalidUtf16(err) => Some(err),
             _ => None,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CdrRepresentation {
     Xcdr1,
     Xcdr2,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Endianness {
     Big,
     Little,
@@ -95,6 +104,147 @@ pub struct CdrDecoder<'a> {
 
 pub trait DecodeCdr: Sized {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self>;
+}
+
+pub trait BorrowDecodeCdr<'a>: Sized {
+    fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self>;
+}
+
+pub trait PrimitiveValue: Copy + Clone + fmt::Debug + PartialEq + PartialOrd + 'static {
+    fn decode_chunk(bytes: &[u8], endianness: Endianness) -> Self;
+}
+
+#[derive(Clone)]
+pub struct PrimitiveSeq<'a, T> {
+    bytes: &'a [u8],
+    endianness: Endianness,
+    _marker: std::marker::PhantomData<T>,
+}
+
+#[derive(Clone)]
+pub struct PrimitiveArray<'a, T, const N: usize> {
+    bytes: &'a [u8],
+    endianness: Endianness,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: PrimitiveValue> PrimitiveSeq<'a, T> {
+    pub fn len(&self) -> usize {
+        self.bytes.len() / size_of::<T>()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn iter(&self) -> PrimitiveSeqIter<'_, T> {
+        PrimitiveSeqIter {
+            chunks: self.bytes.chunks_exact(size_of::<T>()),
+            endianness: self.endianness,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<T> {
+        let len = self.len();
+        let byte_len = self.bytes.len();
+        let mut items = Vec::<T>::with_capacity(len);
+        unsafe {
+            items.set_len(len);
+            copy_bytes_into_simd(self.bytes.as_ptr(), items.as_mut_ptr() as *mut u8, byte_len);
+        }
+        if !native_endianness_matches(self.endianness) {
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(items.as_mut_ptr() as *mut u8, byte_len) };
+            swap_endian_in_place(bytes, size_of::<T>());
+        }
+        items
+    }
+}
+
+impl<'a, T: PrimitiveValue, const N: usize> PrimitiveArray<'a, T, N> {
+    pub fn len(&self) -> usize {
+        N
+    }
+
+    pub fn is_empty(&self) -> bool {
+        N == 0
+    }
+
+    pub fn iter(&self) -> PrimitiveSeqIter<'_, T> {
+        PrimitiveSeqIter {
+            chunks: self.bytes.chunks_exact(size_of::<T>()),
+            endianness: self.endianness,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn to_array(&self) -> [T; N] {
+        let byte_len = self.bytes.len();
+        let mut items = Vec::<T>::with_capacity(N);
+        unsafe {
+            items.set_len(N);
+            copy_bytes_into_simd(self.bytes.as_ptr(), items.as_mut_ptr() as *mut u8, byte_len);
+        }
+        if !native_endianness_matches(self.endianness) {
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(items.as_mut_ptr() as *mut u8, byte_len) };
+            swap_endian_in_place(bytes, size_of::<T>());
+        }
+        items.try_into().ok().expect("primitive array length should match")
+    }
+}
+
+impl<T: PrimitiveValue> fmt::Debug for PrimitiveSeq<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T: PrimitiveValue, const N: usize> fmt::Debug for PrimitiveArray<'_, T, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T: PrimitiveValue> PartialEq for PrimitiveSeq<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl<T: PrimitiveValue, const N: usize> PartialEq for PrimitiveArray<'_, T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl<T: PrimitiveValue> PartialOrd for PrimitiveSeq<'_, T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.iter().partial_cmp(other.iter())
+    }
+}
+
+impl<T: PrimitiveValue, const N: usize> PartialOrd for PrimitiveArray<'_, T, N> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.iter().partial_cmp(other.iter())
+    }
+}
+
+pub struct PrimitiveSeqIter<'a, T> {
+    chunks: std::slice::ChunksExact<'a, u8>,
+    endianness: Endianness,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T: PrimitiveValue> Iterator for PrimitiveSeqIter<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.chunks
+            .next()
+            .map(|chunk| T::decode_chunk(chunk, self.endianness))
+    }
 }
 
 pub struct CdrEncoder {
@@ -115,6 +265,11 @@ pub struct WChar32(pub char);
 pub struct CdrEncoding {
     pub cdr_representation: CdrRepresentation,
     pub endianness: Endianness,
+}
+
+fn native_endianness_matches(endianness: Endianness) -> bool {
+    cfg!(target_endian = "little") && matches!(endianness, Endianness::Little)
+        || cfg!(target_endian = "big") && matches!(endianness, Endianness::Big)
 }
 
 impl CdrEncoding {
@@ -226,6 +381,90 @@ impl<'a> CdrDecoder<'a> {
         Ok(bytes)
     }
 
+    fn native_endianness_matches(&self) -> bool {
+        native_endianness_matches(self.endianness)
+    }
+
+    fn read_native_primitive_seq<T: Copy>(&mut self) -> CdrResult<Vec<T>> {
+        let length = self.read_u32()? as usize;
+        self.align_to(size_of::<T>());
+        let byte_len = length
+            .checked_mul(size_of::<T>())
+            .ok_or(CdrError::LengthOverflow {
+                context: "CdrDecoder::read_native_primitive_seq",
+            })?;
+        let bytes = self.read_bytes_raw(byte_len)?;
+        let mut items = Vec::<T>::with_capacity(length);
+        unsafe {
+            items.set_len(length);
+            copy_bytes_into_simd(bytes.as_ptr(), items.as_mut_ptr() as *mut u8, byte_len);
+        }
+        Ok(items)
+    }
+
+    fn read_swapped_primitive_seq<T: Copy>(&mut self) -> CdrResult<Vec<T>> {
+        let length = self.read_u32()? as usize;
+        self.align_to(size_of::<T>());
+        let byte_len = length
+            .checked_mul(size_of::<T>())
+            .ok_or(CdrError::LengthOverflow {
+                context: "CdrDecoder::read_swapped_primitive_seq",
+            })?;
+        let bytes = self.read_bytes_raw(byte_len)?;
+        let mut swapped = bytes.to_vec();
+        swap_endian_in_place(&mut swapped, size_of::<T>());
+        let mut items = Vec::<T>::with_capacity(length);
+        unsafe {
+            items.set_len(length);
+            copy_bytes_into_simd(swapped.as_ptr(), items.as_mut_ptr() as *mut u8, byte_len);
+        }
+        Ok(items)
+    }
+
+    fn read_native_primitive_array<T: Copy, const N: usize>(&mut self) -> CdrResult<[T; N]> {
+        self.align_to(size_of::<T>());
+        let byte_len = N
+            .checked_mul(size_of::<T>())
+            .ok_or(CdrError::LengthOverflow {
+                context: "CdrDecoder::read_native_primitive_array",
+            })?;
+        let bytes = self.read_bytes_raw(byte_len)?;
+        let mut items = Vec::<T>::with_capacity(N);
+        unsafe {
+            items.set_len(N);
+            copy_bytes_into_simd(bytes.as_ptr(), items.as_mut_ptr() as *mut u8, byte_len);
+        }
+        items
+            .try_into()
+            .map_err(|items: Vec<T>| CdrError::FixedArrayLength {
+                expected: N,
+                actual: items.len(),
+            })
+    }
+
+    fn read_swapped_primitive_array<T: Copy, const N: usize>(&mut self) -> CdrResult<[T; N]> {
+        self.align_to(size_of::<T>());
+        let byte_len = N
+            .checked_mul(size_of::<T>())
+            .ok_or(CdrError::LengthOverflow {
+                context: "CdrDecoder::read_swapped_primitive_array",
+            })?;
+        let bytes = self.read_bytes_raw(byte_len)?;
+        let mut swapped = bytes.to_vec();
+        swap_endian_in_place(&mut swapped, size_of::<T>());
+        let mut items = Vec::<T>::with_capacity(N);
+        unsafe {
+            items.set_len(N);
+            copy_bytes_into_simd(swapped.as_ptr(), items.as_mut_ptr() as *mut u8, byte_len);
+        }
+        items
+            .try_into()
+            .map_err(|items: Vec<T>| CdrError::FixedArrayLength {
+                expected: N,
+                actual: items.len(),
+            })
+    }
+
     pub fn read_bytes(&mut self, length: usize) -> CdrResult<Vec<u8>> {
         let bytes = self.read_bytes_raw(length)?;
         Ok(bytes.to_vec())
@@ -234,6 +473,22 @@ impl<'a> CdrDecoder<'a> {
     pub fn read_octet_seq(&mut self) -> CdrResult<Vec<u8>> {
         let length = self.read_u32()?;
         self.read_bytes(length as usize)
+    }
+
+    pub fn read_octet_slice(&mut self) -> CdrResult<&'a [u8]> {
+        let length = self.read_u32()? as usize;
+        self.read_bytes_raw(length)
+    }
+
+    pub fn read_byte_array<const N: usize>(&mut self) -> CdrResult<[u8; N]> {
+        let bytes = self.read_bytes_raw(N)?;
+        match bytes.try_into() {
+            Ok(array) => Ok(array),
+            Err(_) => Err(CdrError::FixedArrayLength {
+                expected: N,
+                actual: bytes.len(),
+            }),
+        }
     }
 
     pub fn read_string(&mut self) -> CdrResult<String> {
@@ -252,6 +507,23 @@ impl<'a> CdrDecoder<'a> {
         };
 
         String::from_utf8(bytes.to_vec()).map_err(CdrError::InvalidUtf8)
+    }
+
+    pub fn read_str(&mut self) -> CdrResult<&'a str> {
+        let length = self.read_u32()? as usize;
+
+        if length == 0 {
+            return Ok("");
+        }
+
+        let bytes = self.read_bytes_raw(length)?;
+        let bytes = if bytes.last() == Some(&0) {
+            &bytes[..bytes.len() - 1]
+        } else {
+            bytes
+        };
+
+        std::str::from_utf8(bytes).map_err(CdrError::InvalidUtf8Slice)
     }
 
     pub fn read_char(&mut self) -> CdrResult<char> {
@@ -503,6 +775,18 @@ impl<'a> CdrDecoder<'a> {
         Ok(items)
     }
 
+    pub fn read_borrow_seq<T>(&mut self) -> CdrResult<Vec<T>>
+    where
+        T: BorrowDecodeCdr<'a>,
+    {
+        let length = self.read_u32()? as usize;
+        let mut items = Vec::with_capacity(length);
+        for _ in 0..length {
+            items.push(T::borrow_decode_cdr(self)?);
+        }
+        Ok(items)
+    }
+
     pub fn read_array<T, const N: usize>(&mut self) -> CdrResult<[T; N]>
     where
         T: DecodeCdr,
@@ -517,6 +801,167 @@ impl<'a> CdrDecoder<'a> {
                 expected: N,
                 actual: items.len(),
             })
+    }
+
+    pub fn read_borrow_array<T, const N: usize>(&mut self) -> CdrResult<[T; N]>
+    where
+        T: BorrowDecodeCdr<'a>,
+    {
+        let mut items = Vec::with_capacity(N);
+        for _ in 0..N {
+            items.push(T::borrow_decode_cdr(self)?);
+        }
+        items
+            .try_into()
+            .map_err(|items: Vec<T>| CdrError::FixedArrayLength {
+                expected: N,
+                actual: items.len(),
+            })
+    }
+
+    pub fn read_primitive_seq_borrowed<T: PrimitiveValue>(&mut self) -> CdrResult<PrimitiveSeq<'a, T>> {
+        let length = self.read_u32()? as usize;
+        self.align_to(size_of::<T>());
+        let byte_len = length
+            .checked_mul(size_of::<T>())
+            .ok_or(CdrError::LengthOverflow {
+                context: "CdrDecoder::read_primitive_seq_borrowed",
+            })?;
+        let bytes = self.read_bytes_raw(byte_len)?;
+        Ok(PrimitiveSeq {
+            bytes,
+            endianness: self.endianness,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    pub fn read_primitive_array_borrowed<T: PrimitiveValue, const N: usize>(
+        &mut self,
+    ) -> CdrResult<PrimitiveArray<'a, T, N>> {
+        self.align_to(size_of::<T>());
+        let byte_len = N
+            .checked_mul(size_of::<T>())
+            .ok_or(CdrError::LengthOverflow {
+                context: "CdrDecoder::read_primitive_array_borrowed",
+            })?;
+        let bytes = self.read_bytes_raw(byte_len)?;
+        Ok(PrimitiveArray {
+            bytes,
+            endianness: self.endianness,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    pub fn read_u16_seq(&mut self) -> CdrResult<Vec<u16>> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_seq::<u16>();
+        }
+        self.read_swapped_primitive_seq::<u16>()
+    }
+
+    pub fn read_u32_seq(&mut self) -> CdrResult<Vec<u32>> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_seq::<u32>();
+        }
+        self.read_swapped_primitive_seq::<u32>()
+    }
+
+    pub fn read_u64_seq(&mut self) -> CdrResult<Vec<u64>> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_seq::<u64>();
+        }
+        self.read_swapped_primitive_seq::<u64>()
+    }
+
+    pub fn read_i16_seq(&mut self) -> CdrResult<Vec<i16>> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_seq::<i16>();
+        }
+        self.read_swapped_primitive_seq::<i16>()
+    }
+
+    pub fn read_i32_seq(&mut self) -> CdrResult<Vec<i32>> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_seq::<i32>();
+        }
+        self.read_swapped_primitive_seq::<i32>()
+    }
+
+    pub fn read_i64_seq(&mut self) -> CdrResult<Vec<i64>> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_seq::<i64>();
+        }
+        self.read_swapped_primitive_seq::<i64>()
+    }
+
+    pub fn read_f32_seq(&mut self) -> CdrResult<Vec<f32>> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_seq::<f32>();
+        }
+        self.read_swapped_primitive_seq::<f32>()
+    }
+
+    pub fn read_f64_seq(&mut self) -> CdrResult<Vec<f64>> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_seq::<f64>();
+        }
+        self.read_swapped_primitive_seq::<f64>()
+    }
+
+    pub fn read_u16_array<const N: usize>(&mut self) -> CdrResult<[u16; N]> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_array::<u16, N>();
+        }
+        self.read_swapped_primitive_array::<u16, N>()
+    }
+
+    pub fn read_u32_array<const N: usize>(&mut self) -> CdrResult<[u32; N]> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_array::<u32, N>();
+        }
+        self.read_swapped_primitive_array::<u32, N>()
+    }
+
+    pub fn read_u64_array<const N: usize>(&mut self) -> CdrResult<[u64; N]> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_array::<u64, N>();
+        }
+        self.read_swapped_primitive_array::<u64, N>()
+    }
+
+    pub fn read_i16_array<const N: usize>(&mut self) -> CdrResult<[i16; N]> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_array::<i16, N>();
+        }
+        self.read_swapped_primitive_array::<i16, N>()
+    }
+
+    pub fn read_i32_array<const N: usize>(&mut self) -> CdrResult<[i32; N]> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_array::<i32, N>();
+        }
+        self.read_swapped_primitive_array::<i32, N>()
+    }
+
+    pub fn read_i64_array<const N: usize>(&mut self) -> CdrResult<[i64; N]> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_array::<i64, N>();
+        }
+        self.read_swapped_primitive_array::<i64, N>()
+    }
+
+    pub fn read_f32_array<const N: usize>(&mut self) -> CdrResult<[f32; N]> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_array::<f32, N>();
+        }
+        self.read_swapped_primitive_array::<f32, N>()
+    }
+
+    pub fn read_f64_array<const N: usize>(&mut self) -> CdrResult<[f64; N]> {
+        if self.native_endianness_matches() {
+            return self.read_native_primitive_array::<f64, N>();
+        }
+        self.read_swapped_primitive_array::<f64, N>()
     }
 }
 
@@ -537,6 +982,61 @@ impl CdrEncoder {
             .resize(self.data_raw.len() + padding_length, 0);
     }
 
+    fn native_endianness_matches(&self) -> bool {
+        native_endianness_matches(self.endianness)
+    }
+
+    fn write_native_primitive_slice<T: Copy>(&mut self, value: &[T], write_len: bool) -> CdrResult<()> {
+        if write_len {
+            self.write_u32(value.len() as u32);
+        }
+        self.align_to(size_of::<T>());
+        let byte_len = value
+            .len()
+            .checked_mul(size_of::<T>())
+            .ok_or(CdrError::LengthOverflow {
+                context: "CdrEncoder::write_native_primitive_slice",
+            })?;
+        let old_len = self.data_raw.len();
+        self.data_raw.resize(old_len + byte_len, 0);
+        unsafe {
+            copy_bytes_into_simd(
+                value.as_ptr() as *const u8,
+                self.data_raw.as_mut_ptr().add(old_len),
+                byte_len,
+            );
+        }
+        Ok(())
+    }
+
+    fn write_swapped_primitive_slice<T: Copy>(
+        &mut self,
+        value: &[T],
+        write_len: bool,
+    ) -> CdrResult<()> {
+        if write_len {
+            self.write_u32(value.len() as u32);
+        }
+        self.align_to(size_of::<T>());
+        let byte_len = value
+            .len()
+            .checked_mul(size_of::<T>())
+            .ok_or(CdrError::LengthOverflow {
+                context: "CdrEncoder::write_swapped_primitive_slice",
+            })?;
+        let old_len = self.data_raw.len();
+        self.data_raw.resize(old_len + byte_len, 0);
+        unsafe {
+            copy_bytes_into_simd(
+                value.as_ptr() as *const u8,
+                self.data_raw.as_mut_ptr().add(old_len),
+                byte_len,
+            );
+        }
+        swap_endian_in_place(&mut self.data_raw[old_len..old_len + byte_len], size_of::<T>());
+        Ok(())
+    }
+
     pub fn write_wstring(&mut self, value: &str) {
         let utf16: Vec<u16> = value.encode_utf16().collect();
         self.write_u32((utf16.len() + 1) as u32);
@@ -549,7 +1049,7 @@ impl CdrEncoder {
     pub fn write_string(&mut self, value: &str) {
         let bytes = value.as_bytes();
         self.write_u32((bytes.len() + 1) as u32);
-        self.write_bytes_raw(bytes.to_vec());
+        self.write_bytes_raw(bytes);
         self.write_u8(0);
     }
 
@@ -576,13 +1076,11 @@ impl CdrEncoder {
     }
 
     pub fn write_u16(&mut self, value: u16) {
-        let data = match self.endianness {
-            Endianness::Big => value.to_be_bytes(),
-            Endianness::Little => value.to_le_bytes(),
-        }
-        .to_vec();
         self.align_to(size_of::<u16>());
-        self.write_bytes_raw(data);
+        match self.endianness {
+            Endianness::Big => self.write_bytes_raw(&value.to_be_bytes()),
+            Endianness::Little => self.write_bytes_raw(&value.to_le_bytes()),
+        }
     }
 
     pub fn write_u8(&mut self, value: u8) {
@@ -594,86 +1092,78 @@ impl CdrEncoder {
     }
 
     pub fn write_i8(&mut self, value: i8) {
-        self.write_bytes_raw(value.to_ne_bytes().to_vec());
+        self.write_bytes_raw(&value.to_ne_bytes());
     }
 
     pub fn write_u32(&mut self, value: u32) {
-        let data = match self.endianness {
-            Endianness::Big => value.to_be_bytes(),
-            Endianness::Little => value.to_le_bytes(),
-        }
-        .to_vec();
         self.align_to(size_of::<u32>());
-        self.write_bytes_raw(data);
+        match self.endianness {
+            Endianness::Big => self.write_bytes_raw(&value.to_be_bytes()),
+            Endianness::Little => self.write_bytes_raw(&value.to_le_bytes()),
+        }
     }
 
     pub fn write_u64(&mut self, value: u64) {
-        let data = match self.endianness {
-            Endianness::Big => value.to_be_bytes(),
-            Endianness::Little => value.to_le_bytes(),
-        }
-        .to_vec();
         self.align_to(size_of::<u64>());
-        self.write_bytes_raw(data);
+        match self.endianness {
+            Endianness::Big => self.write_bytes_raw(&value.to_be_bytes()),
+            Endianness::Little => self.write_bytes_raw(&value.to_le_bytes()),
+        }
     }
 
     pub fn write_i16(&mut self, value: i16) {
-        let data = match self.endianness {
-            Endianness::Big => value.to_be_bytes(),
-            Endianness::Little => value.to_le_bytes(),
-        }
-        .to_vec();
         self.align_to(size_of::<i16>());
-        self.write_bytes_raw(data);
+        match self.endianness {
+            Endianness::Big => self.write_bytes_raw(&value.to_be_bytes()),
+            Endianness::Little => self.write_bytes_raw(&value.to_le_bytes()),
+        }
     }
 
     pub fn write_i32(&mut self, value: i32) {
-        let data = match self.endianness {
-            Endianness::Big => value.to_be_bytes(),
-            Endianness::Little => value.to_le_bytes(),
-        }
-        .to_vec();
         self.align_to(size_of::<i32>());
-        self.write_bytes_raw(data);
+        match self.endianness {
+            Endianness::Big => self.write_bytes_raw(&value.to_be_bytes()),
+            Endianness::Little => self.write_bytes_raw(&value.to_le_bytes()),
+        }
     }
 
     pub fn write_i64(&mut self, value: i64) {
-        let data = match self.endianness {
-            Endianness::Big => value.to_be_bytes(),
-            Endianness::Little => value.to_le_bytes(),
-        }
-        .to_vec();
         self.align_to(size_of::<i64>());
-        self.write_bytes_raw(data);
+        match self.endianness {
+            Endianness::Big => self.write_bytes_raw(&value.to_be_bytes()),
+            Endianness::Little => self.write_bytes_raw(&value.to_le_bytes()),
+        }
     }
 
     pub fn write_f32(&mut self, value: f32) {
-        let data = match self.endianness {
-            Endianness::Big => value.to_be_bytes(),
-            Endianness::Little => value.to_le_bytes(),
-        }
-        .to_vec();
         self.align_to(size_of::<f32>());
-        self.write_bytes_raw(data);
+        match self.endianness {
+            Endianness::Big => self.write_bytes_raw(&value.to_be_bytes()),
+            Endianness::Little => self.write_bytes_raw(&value.to_le_bytes()),
+        }
     }
 
     pub fn write_f64(&mut self, value: f64) {
-        let data = match self.endianness {
-            Endianness::Big => value.to_be_bytes(),
-            Endianness::Little => value.to_le_bytes(),
-        }
-        .to_vec();
         self.align_to(size_of::<f64>());
-        self.write_bytes_raw(data);
+        match self.endianness {
+            Endianness::Big => self.write_bytes_raw(&value.to_be_bytes()),
+            Endianness::Little => self.write_bytes_raw(&value.to_le_bytes()),
+        }
     }
 
-    pub fn write_bytes_raw(&mut self, value: Vec<u8>) {
-        self.data_raw.extend_from_slice(&value);
+    pub fn write_bytes_raw(&mut self, value: &[u8]) {
+        self.data_raw.extend_from_slice(value);
     }
 
-    pub fn write_octet_bytes(&mut self, value: Vec<u8>) {
+    pub fn write_octet_bytes(&mut self, value: &[u8]) -> CdrResult<()> {
         self.write_u32(value.len() as u32);
         self.write_bytes_raw(value);
+        Ok(())
+    }
+
+    pub fn write_byte_array<const N: usize>(&mut self, value: &[u8; N]) -> CdrResult<()> {
+        self.write_bytes_raw(value);
+        Ok(())
     }
 
     pub fn write_seq<T: EncodeCdr>(&mut self, value: &[T]) -> CdrResult<()> {
@@ -690,11 +1180,245 @@ impl CdrEncoder {
         }
         Ok(())
     }
+
+    pub fn write_u16_seq(&mut self, value: &[u16]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, true);
+        }
+        self.write_swapped_primitive_slice(value, true)
+    }
+
+    pub fn write_u32_seq(&mut self, value: &[u32]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, true);
+        }
+        self.write_swapped_primitive_slice(value, true)
+    }
+
+    pub fn write_u64_seq(&mut self, value: &[u64]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, true);
+        }
+        self.write_swapped_primitive_slice(value, true)
+    }
+
+    pub fn write_i16_seq(&mut self, value: &[i16]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, true);
+        }
+        self.write_swapped_primitive_slice(value, true)
+    }
+
+    pub fn write_i32_seq(&mut self, value: &[i32]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, true);
+        }
+        self.write_swapped_primitive_slice(value, true)
+    }
+
+    pub fn write_i64_seq(&mut self, value: &[i64]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, true);
+        }
+        self.write_swapped_primitive_slice(value, true)
+    }
+
+    pub fn write_f32_seq(&mut self, value: &[f32]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, true);
+        }
+        self.write_swapped_primitive_slice(value, true)
+    }
+
+    pub fn write_f64_seq(&mut self, value: &[f64]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, true);
+        }
+        self.write_swapped_primitive_slice(value, true)
+    }
+
+    pub fn write_u16_array<const N: usize>(&mut self, value: &[u16; N]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, false);
+        }
+        self.write_swapped_primitive_slice(value, false)
+    }
+
+    pub fn write_u32_array<const N: usize>(&mut self, value: &[u32; N]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, false);
+        }
+        self.write_swapped_primitive_slice(value, false)
+    }
+
+    pub fn write_u64_array<const N: usize>(&mut self, value: &[u64; N]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, false);
+        }
+        self.write_swapped_primitive_slice(value, false)
+    }
+
+    pub fn write_i16_array<const N: usize>(&mut self, value: &[i16; N]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, false);
+        }
+        self.write_swapped_primitive_slice(value, false)
+    }
+
+    pub fn write_i32_array<const N: usize>(&mut self, value: &[i32; N]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, false);
+        }
+        self.write_swapped_primitive_slice(value, false)
+    }
+
+    pub fn write_i64_array<const N: usize>(&mut self, value: &[i64; N]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, false);
+        }
+        self.write_swapped_primitive_slice(value, false)
+    }
+
+    pub fn write_f32_array<const N: usize>(&mut self, value: &[f32; N]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, false);
+        }
+        self.write_swapped_primitive_slice(value, false)
+    }
+
+    pub fn write_f64_array<const N: usize>(&mut self, value: &[f64; N]) -> CdrResult<()> {
+        if self.native_endianness_matches() {
+            return self.write_native_primitive_slice(value, false);
+        }
+        self.write_swapped_primitive_slice(value, false)
+    }
+}
+
+fn swap_endian_in_place(bytes: &mut [u8], elem_size: usize) {
+    if bytes.len() < elem_size || elem_size <= 1 {
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("ssse3") {
+            unsafe { swap_endian_in_place_ssse3(bytes, elem_size) };
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        swap_endian_in_place_neon(bytes, elem_size);
+        return;
+    }
+
+    for chunk in bytes.chunks_exact_mut(elem_size) {
+        chunk.reverse();
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_bytes_into_simd(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
+
+    let mut offset = 0usize;
+    while offset + 16 <= len {
+        let chunk = unsafe { _mm_loadu_si128(src.add(offset) as *const __m128i) };
+        unsafe { _mm_storeu_si128(dst.add(offset) as *mut __m128i, chunk) };
+        offset += 16;
+    }
+    unsafe { ptr::copy_nonoverlapping(src.add(offset), dst.add(offset), len - offset) };
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn copy_bytes_into_simd(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
+
+    let mut offset = 0usize;
+    while offset + 16 <= len {
+        let chunk: uint8x16_t = unsafe { vld1q_u8(src.add(offset)) };
+        unsafe { vst1q_u8(dst.add(offset), chunk) };
+        offset += 16;
+    }
+    unsafe { ptr::copy_nonoverlapping(src.add(offset), dst.add(offset), len - offset) };
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+unsafe fn copy_bytes_into_simd(src: *const u8, dst: *mut u8, len: usize) {
+    unsafe { ptr::copy_nonoverlapping(src, dst, len) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn swap_endian_in_place_ssse3(bytes: &mut [u8], elem_size: usize) {
+    use std::arch::x86_64::{
+        __m128i, _mm_loadu_si128, _mm_setr_epi8, _mm_shuffle_epi8, _mm_storeu_si128,
+    };
+
+    let mask = match elem_size {
+        2 => _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14),
+        4 => _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12),
+        8 => _mm_setr_epi8(7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8),
+        _ => {
+            for chunk in bytes.chunks_exact_mut(elem_size) {
+                chunk.reverse();
+            }
+            return;
+        }
+    };
+
+    let simd_len = bytes.len() - (bytes.len() % 16);
+    let mut offset = 0usize;
+    while offset < simd_len {
+        let chunk = unsafe { _mm_loadu_si128(bytes.as_ptr().add(offset) as *const __m128i) };
+        let swapped = _mm_shuffle_epi8(chunk, mask);
+        unsafe { _mm_storeu_si128(bytes.as_mut_ptr().add(offset) as *mut __m128i, swapped) };
+        offset += 16;
+    }
+
+    for chunk in bytes[simd_len..].chunks_exact_mut(elem_size) {
+        chunk.reverse();
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn swap_endian_in_place_neon(bytes: &mut [u8], elem_size: usize) {
+    use std::arch::aarch64::{uint8x16_t, vld1q_u8, vrev16q_u8, vrev32q_u8, vrev64q_u8, vst1q_u8};
+
+    let simd_len = bytes.len() - (bytes.len() % 16);
+    let mut offset = 0usize;
+    while offset < simd_len {
+        let chunk = unsafe { vld1q_u8(bytes.as_ptr().add(offset)) };
+        let swapped: uint8x16_t = match elem_size {
+            2 => vrev16q_u8(chunk),
+            4 => vrev32q_u8(chunk),
+            8 => vrev64q_u8(chunk),
+            _ => {
+                for chunk in bytes[offset..].chunks_exact_mut(elem_size) {
+                    chunk.reverse();
+                }
+                return;
+            }
+        };
+        unsafe { vst1q_u8(bytes.as_mut_ptr().add(offset), swapped) };
+        offset += 16;
+    }
+
+    for chunk in bytes[simd_len..].chunks_exact_mut(elem_size) {
+        chunk.reverse();
+    }
 }
 
 pub fn decode_from_bytes<T: DecodeCdr>(bytes: &[u8]) -> CdrResult<T> {
     let mut cdr_decoder = CdrDecoder::new(bytes)?;
     T::decode_cdr(&mut cdr_decoder)
+}
+
+pub fn borrow_decode_from_bytes<'a, T: BorrowDecodeCdr<'a>>(bytes: &'a [u8]) -> CdrResult<T> {
+    let mut cdr_decoder = CdrDecoder::new(bytes)?;
+    T::borrow_decode_cdr(&mut cdr_decoder)
 }
 
 pub fn encode_to_vec<T: EncodeCdr>(value: &T) -> CdrResult<Vec<u8>> {
@@ -745,6 +1469,15 @@ impl EncodeCdr for u16 {
     }
 }
 
+impl PrimitiveValue for u16 {
+    fn decode_chunk(bytes: &[u8], endianness: Endianness) -> Self {
+        match endianness {
+            Endianness::Big => u16::from_be_bytes(bytes.try_into().expect("u16 chunk")),
+            Endianness::Little => u16::from_le_bytes(bytes.try_into().expect("u16 chunk")),
+        }
+    }
+}
+
 impl DecodeCdr for u32 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_u32()
@@ -758,6 +1491,15 @@ impl EncodeCdr for u32 {
     }
 }
 
+impl PrimitiveValue for u32 {
+    fn decode_chunk(bytes: &[u8], endianness: Endianness) -> Self {
+        match endianness {
+            Endianness::Big => u32::from_be_bytes(bytes.try_into().expect("u32 chunk")),
+            Endianness::Little => u32::from_le_bytes(bytes.try_into().expect("u32 chunk")),
+        }
+    }
+}
+
 impl DecodeCdr for u64 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_u64()
@@ -768,6 +1510,15 @@ impl EncodeCdr for u64 {
     fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_u64(*self);
         Ok(())
+    }
+}
+
+impl PrimitiveValue for u64 {
+    fn decode_chunk(bytes: &[u8], endianness: Endianness) -> Self {
+        match endianness {
+            Endianness::Big => u64::from_be_bytes(bytes.try_into().expect("u64 chunk")),
+            Endianness::Little => u64::from_le_bytes(bytes.try_into().expect("u64 chunk")),
+        }
     }
 }
 
@@ -797,6 +1548,15 @@ impl EncodeCdr for i16 {
     }
 }
 
+impl PrimitiveValue for i16 {
+    fn decode_chunk(bytes: &[u8], endianness: Endianness) -> Self {
+        match endianness {
+            Endianness::Big => i16::from_be_bytes(bytes.try_into().expect("i16 chunk")),
+            Endianness::Little => i16::from_le_bytes(bytes.try_into().expect("i16 chunk")),
+        }
+    }
+}
+
 impl DecodeCdr for i32 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_i32()
@@ -807,6 +1567,15 @@ impl EncodeCdr for i32 {
     fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_i32(*self);
         Ok(())
+    }
+}
+
+impl PrimitiveValue for i32 {
+    fn decode_chunk(bytes: &[u8], endianness: Endianness) -> Self {
+        match endianness {
+            Endianness::Big => i32::from_be_bytes(bytes.try_into().expect("i32 chunk")),
+            Endianness::Little => i32::from_le_bytes(bytes.try_into().expect("i32 chunk")),
+        }
     }
 }
 
@@ -823,6 +1592,15 @@ impl EncodeCdr for i64 {
     }
 }
 
+impl PrimitiveValue for i64 {
+    fn decode_chunk(bytes: &[u8], endianness: Endianness) -> Self {
+        match endianness {
+            Endianness::Big => i64::from_be_bytes(bytes.try_into().expect("i64 chunk")),
+            Endianness::Little => i64::from_le_bytes(bytes.try_into().expect("i64 chunk")),
+        }
+    }
+}
+
 impl DecodeCdr for f32 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_f32()
@@ -836,6 +1614,15 @@ impl EncodeCdr for f32 {
     }
 }
 
+impl PrimitiveValue for f32 {
+    fn decode_chunk(bytes: &[u8], endianness: Endianness) -> Self {
+        match endianness {
+            Endianness::Big => f32::from_be_bytes(bytes.try_into().expect("f32 chunk")),
+            Endianness::Little => f32::from_le_bytes(bytes.try_into().expect("f32 chunk")),
+        }
+    }
+}
+
 impl DecodeCdr for f64 {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_f64()
@@ -846,6 +1633,15 @@ impl EncodeCdr for f64 {
     fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
         encoder.write_f64(*self);
         Ok(())
+    }
+}
+
+impl PrimitiveValue for f64 {
+    fn decode_chunk(bytes: &[u8], endianness: Endianness) -> Self {
+        match endianness {
+            Endianness::Big => f64::from_be_bytes(bytes.try_into().expect("f64 chunk")),
+            Endianness::Little => f64::from_le_bytes(bytes.try_into().expect("f64 chunk")),
+        }
     }
 }
 
@@ -864,6 +1660,12 @@ impl EncodeCdr for char {
 impl DecodeCdr for String {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {
         decoder.read_string()
+    }
+}
+
+impl<'a> BorrowDecodeCdr<'a> for &'a str {
+    fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
+        decoder.read_str()
     }
 }
 
@@ -1002,6 +1804,30 @@ mod test {
     }
 
     #[test]
+    fn read_byte_array_reads_fixed_bytes() {
+        let bytes = little_endian_message(&[0x2a, 0x2b, 0x2c, 0x2d]);
+        let mut decoder = CdrDecoder::new(&bytes).expect("decoder should be created");
+        assert_eq!(
+            decoder
+                .read_byte_array::<4>()
+                .expect("byte array should decode"),
+            [0x2a, 0x2b, 0x2c, 0x2d]
+        );
+    }
+
+    #[test]
+    fn read_f32_seq_decodes_specialized_sequence() {
+        let bytes = little_endian_message(&[
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x40,
+        ]);
+        let mut decoder = CdrDecoder::new(&bytes).expect("decoder should be created");
+        assert_eq!(
+            decoder.read_f32_seq().expect("f32 seq should decode"),
+            vec![1.0, 2.0]
+        );
+    }
+
+    #[test]
     fn wchar_wrapper_types_decode() {
         let wchar16_bytes = little_endian_message(&[0x41, 0x00]);
         assert_eq!(
@@ -1050,5 +1876,17 @@ mod test {
         let mut decoder = CdrDecoder::new(&encoder.data_raw).expect("decoder should be created");
         assert_eq!(decoder.read_u8().expect("u8 should decode"), 7);
         assert_eq!(decoder.read_u64().expect("u64 should decode"), 42);
+    }
+
+    #[test]
+    fn write_byte_array_encodes_fixed_bytes() {
+        let mut encoder = CdrEncoder::new(CdrEncoding {
+            cdr_representation: CdrRepresentation::Xcdr1,
+            endianness: Endianness::Little,
+        });
+        encoder
+            .write_byte_array(&[0x2a, 0x2b, 0x2c, 0x2d])
+            .expect("byte array should encode");
+        assert_eq!(encoder.data_raw, little_endian_message(&[0x2a, 0x2b, 0x2c, 0x2d]));
     }
 }
