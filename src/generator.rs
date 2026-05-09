@@ -1117,11 +1117,15 @@ fn strip_container_type(rust_type: &str) -> &str {
 }
 
 fn is_dynamic_byte_sequence(field: &super::parser::Field) -> bool {
-    field.is_array && field.array_size.is_none() && matches!(field.field_type.as_str(), "byte" | "uint8")
+    field.is_array
+        && field.array_size.is_none()
+        && matches!(field.field_type.as_str(), "byte" | "uint8")
 }
 
 fn is_fixed_byte_array(field: &super::parser::Field) -> bool {
-    field.is_array && field.array_size.is_some() && matches!(field.field_type.as_str(), "byte" | "uint8")
+    field.is_array
+        && field.array_size.is_some()
+        && matches!(field.field_type.as_str(), "byte" | "uint8")
 }
 
 fn primitive_seq_decode_method(field: &super::parser::Field) -> Option<&'static str> {
@@ -1214,7 +1218,10 @@ fn borrowed_to_owned_impl(message: &MessageType, style: StructNameStyle) -> Stri
         "    pub fn to_owned(&self) -> crate::{}::{} {{\n",
         target_module, struct_name
     ));
-    content.push_str(&format!("        crate::{}::{} {{\n", target_module, struct_name));
+    content.push_str(&format!(
+        "        crate::{}::{} {{\n",
+        target_module, struct_name
+    ));
     for field in &message.fields {
         content.push_str(&format!(
             "            {}: {},\n",
@@ -1230,10 +1237,7 @@ fn borrowed_to_owned_impl(message: &MessageType, style: StructNameStyle) -> Stri
 
 fn borrowed_constants_impl(message: &MessageType, style: StructNameStyle) -> String {
     let mut content = String::new();
-    content.push_str(&format!(
-        "impl<'a> {}<'a> {{\n",
-        message.struct_name(style)
-    ));
+    content.push_str(&format!("impl<'a> {}<'a> {{\n", message.struct_name(style)));
     for constant in &message.constants {
         let (ty, value) = format_constant(constant);
         content.push_str(&format!(
@@ -1288,16 +1292,10 @@ fn borrowed_non_array_type(
 ) -> String {
     let owned_type = field.rust_type(current_package);
     if owned_type.contains("::msg::") {
-        return format!(
-            "{}<'a>",
-            owned_type.replacen("::msg::", "::borrowed::", 1)
-        );
+        return format!("{}<'a>", owned_type.replacen("::msg::", "::borrowed::", 1));
     }
     if owned_type.contains("::srv::") {
-        return format!(
-            "{}<'a>",
-            owned_type.replacen("::srv::", "::borrowed::", 1)
-        );
+        return format!("{}<'a>", owned_type.replacen("::srv::", "::borrowed::", 1));
     }
 
     let struct_name = field_type_struct_name(&field.field_type, style);
@@ -1402,7 +1400,8 @@ fn borrow_decode_impl(message: &MessageType, style: StructNameStyle) -> String {
         "impl<'a> BorrowDecodeCdr<'a> for {}<'a> {{\n",
         struct_name
     ));
-    content.push_str("    fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {\n");
+    content
+        .push_str("    fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {\n");
     content.push_str("        Ok(Self {\n");
     for field in &message.fields {
         content.push_str(&format!(
@@ -2041,8 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_borrowed_module_uses_borrowed_fields() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn generated_borrowed_module_uses_borrowed_fields() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
         let std_pkg_dir = temp_dir.path().join("std_msgs");
         let std_msg_dir = std_pkg_dir.join("msg");
@@ -2069,14 +2067,22 @@ mod tests {
         assert!(borrowed_content.contains("pub label: &'a str,"));
         assert!(borrowed_content.contains("pub raw_bytes: &'a [u8],"));
         assert!(borrowed_content.contains("pub samples: cdr_runtime::PrimitiveSeq<'a, f32>,"));
-        assert!(borrowed_content.contains("pub covariance: cdr_runtime::PrimitiveArray<'a, f64, 9>,"));
+        assert!(
+            borrowed_content.contains("pub covariance: cdr_runtime::PrimitiveArray<'a, f64, 9>,")
+        );
         assert!(borrowed_content.contains("pub fn to_owned(&self) -> crate::msg::Blob"));
         assert!(borrow_decode_content.contains("impl<'a> BorrowDecodeCdr<'a> for Blob<'a>"));
         assert!(borrow_decode_content.contains("header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,"));
         assert!(borrow_decode_content.contains("label: decoder.read_str()?,"));
         assert!(borrow_decode_content.contains("raw_bytes: decoder.read_octet_slice()?,"));
-        assert!(borrow_decode_content.contains("samples: decoder.read_primitive_seq_borrowed::<f32>()?,"));
-        assert!(borrow_decode_content.contains("covariance: decoder.read_primitive_array_borrowed::<f64, 9>()?,"));
+        assert!(
+            borrow_decode_content
+                .contains("samples: decoder.read_primitive_seq_borrowed::<f32>()?,")
+        );
+        assert!(
+            borrow_decode_content
+                .contains("covariance: decoder.read_primitive_array_borrowed::<f64, 9>()?,")
+        );
 
         Ok(())
     }
