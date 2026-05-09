@@ -156,3 +156,45 @@ big,decode_borrowed_to_owned,1000,4492000,232.337,18438.325
 The important takeaway is not just that borrowed decode is faster, but that
 `borrowed -> to_owned()` is now close to, or better than, the older direct owned
 decode path on the benchmark fixture.
+
+### Cyclone DDS comparison
+
+The benchmark harness can also compare the generated runtime against Cyclone DDS
+when `CYCLONEDDS_HOME` is set.
+
+This comparison intentionally uses Cyclone DDS' generated low-level `m_ops`
+stream API instead of participant/topic/reader/writer entities, so the numbers
+reflect sample-to-CDR and CDR-to-sample cost rather than discovery or transport.
+
+On the current fixture, a representative run produced:
+
+```text
+generated,little,encode,100,449200,210.430,20357.863
+generated,little,decode_owned,100,449200,218.070,19644.633
+generated,little,decode_borrowed,100,449200,89.970,47614.816
+generated,big,encode,100,449200,233.390,18355.135
+generated,big,decode_owned,100,449200,296.400,14453.121
+generated,big,decode_borrowed,100,449200,121.200,35345.751
+cyclonedds,little,encode,100,448800,131.140,32637.565
+cyclonedds,little,decode_owned,100,448800,250.080,17114.885
+cyclonedds,big,encode,100,448800,249.400,17161.549
+cyclonedds,big,decode_owned,100,448800,504.240,8488.201
+```
+
+The current read of those numbers is:
+
+- Cyclone DDS is faster on the little-endian encode path for this fixture.
+- The generated owned decode path is faster than Cyclone DDS on both little-endian
+  and big-endian decode.
+- The generated borrowed decode path is materially faster than both owned paths.
+- Big-endian decode is currently a particularly strong case for the generated
+  runtime relative to the Cyclone low-level stream path.
+
+There is also a small payload-size mismatch in the printed `payload` rows:
+
+- the generated Rust runtime reports the payload including the 4-byte
+  encapsulation header
+- the Cyclone DDS stream helper reports only the raw stream body size
+
+That difference does not affect the latency comparison, but it means `payload`
+rows should not be compared too literally across implementations.

@@ -311,6 +311,16 @@ If `CYCLONEDDS_HOME` points at a local Cyclone DDS install, the same benchmark
 can also emit a direct `generated` vs `cyclonedds` comparison for the equivalent
 message shape using Cyclone's generated C stream ops.
 
+On the current fixture, the comparison currently reads as follows:
+
+- Cyclone DDS is faster on little-endian encode.
+- The generated owned decode path is faster than Cyclone DDS on little-endian and
+  big-endian decode.
+- The generated borrowed decode path is faster than both owned decode paths.
+
+For the exact benchmark rows and comparison caveats, see
+[Benchmarking](docs/benchmarking.md) and [Performance notes](docs/performance-notes.md).
+
 Generated schema dispatch code is emitted in `ros2-dispatch/src/lib.rs`, for example:
 
 ```rust
