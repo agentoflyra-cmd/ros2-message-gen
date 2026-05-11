@@ -1,4 +1,4 @@
-use std::collections::{HashMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -428,10 +428,8 @@ impl MessageGenerator {
 
         // 1. Build schema names for the current batch
         let msg_refs: Vec<&MessageType> = messages.iter().collect();
-        let srv_refs: Vec<(&MessageType, &MessageType)> = services
-            .iter()
-            .map(|(a, b)| (a, b))
-            .collect();
+        let srv_refs: Vec<(&MessageType, &MessageType)> =
+            services.iter().map(|(a, b)| (a, b)).collect();
         let new_names = collect_schema_names(&msg_refs, &srv_refs);
 
         // 2. Load existing cache (if any); discard if style changed
@@ -929,7 +927,11 @@ fn dispatch_entries(
             type_path: dispatch_msg_type_path(message, style),
             decode_fn_path: dispatch_decode_fn_path(message),
             encode_fn_path: dispatch_encode_fn_path(message),
-            borrowed_type_path: format!("{}::borrowed::{}<'a>", message.package, message.struct_name(style)),
+            borrowed_type_path: format!(
+                "{}::borrowed::{}<'a>",
+                message.package,
+                message.struct_name(style)
+            ),
             borrow_decode_fn_path: dispatch_borrow_decode_fn_path(message),
         });
     }
@@ -941,7 +943,11 @@ fn dispatch_entries(
             type_path: dispatch_srv_type_path(request, style),
             decode_fn_path: dispatch_decode_fn_path(request),
             encode_fn_path: dispatch_encode_fn_path(request),
-            borrowed_type_path: format!("{}::borrowed::{}<'a>", request.package, request.struct_name(style)),
+            borrowed_type_path: format!(
+                "{}::borrowed::{}<'a>",
+                request.package,
+                request.struct_name(style)
+            ),
             borrow_decode_fn_path: dispatch_borrow_decode_fn_path(request),
         });
         entries.push(DispatchEntry {
@@ -950,7 +956,11 @@ fn dispatch_entries(
             type_path: dispatch_srv_type_path(response, style),
             decode_fn_path: dispatch_decode_fn_path(response),
             encode_fn_path: dispatch_encode_fn_path(response),
-            borrowed_type_path: format!("{}::borrowed::{}<'a>", response.package, response.struct_name(style)),
+            borrowed_type_path: format!(
+                "{}::borrowed::{}<'a>",
+                response.package,
+                response.struct_name(style)
+            ),
             borrow_decode_fn_path: dispatch_borrow_decode_fn_path(response),
         });
     }
@@ -1001,7 +1011,10 @@ fn dispatch_encode_fn_path(message: &MessageType) -> String {
 
 #[allow(dead_code)]
 fn dispatch_borrow_decode_fn_path(message: &MessageType) -> String {
-    format!("{}::borrow_decode::borrow_decode_from_bytes", message.package)
+    format!(
+        "{}::borrow_decode::borrow_decode_from_bytes",
+        message.package
+    )
 }
 
 /// 从 schema 名称中提取包名、种类(msg/srv)和原始 ROS 类型名
@@ -1014,7 +1027,10 @@ fn parse_schema_name(schema_name: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// 从 schema 名称重建 DispatchEntry（不依赖 MessageType，只靠 schema 名称和命名风格）
-fn rebuild_entry_from_schema_name(schema_name: &str, style: StructNameStyle) -> Option<DispatchEntry> {
+fn rebuild_entry_from_schema_name(
+    schema_name: &str,
+    style: StructNameStyle,
+) -> Option<DispatchEntry> {
     let (pkg, _kind, ros_type_name) = parse_schema_name(schema_name)?;
     // 用 MessageType::struct_name 相同的逻辑计算 struct_name
     let struct_name = match style {
@@ -1112,10 +1128,7 @@ fn load_dispatch_schemas(dispatch_dir: &Path) -> (Option<StructNameStyle>, BTree
             None
         }
     });
-    let names: BTreeSet<String> = lines
-        .filter(|l| !l.is_empty())
-        .map(String::from)
-        .collect();
+    let names: BTreeSet<String> = lines.filter(|l| !l.is_empty()).map(String::from).collect();
     (style, names)
 }
 
@@ -1446,7 +1459,11 @@ fn borrowed_struct_definition(message: &MessageType, style: StructNameStyle) -> 
     content
 }
 
-fn borrowed_to_owned_impl(message: &MessageType, is_service: bool, style: StructNameStyle) -> String {
+fn borrowed_to_owned_impl(
+    message: &MessageType,
+    is_service: bool,
+    style: StructNameStyle,
+) -> String {
     let struct_name = message.struct_name(style);
     let target_module = if is_service { "srv" } else { "msg" };
     let mut content = String::new();
@@ -2073,17 +2090,26 @@ mod tests {
 
         // Verify dispatch crate now also contains nav_msgs entries
         let dispatch_after = fs::read_to_string(output_dir.join("ros2-dispatch/src/lib.rs"))?;
-        assert!(dispatch_after.contains("nav_msgs/msg/Path"),
-            "append mode: nav_msgs/msg/Path should appear in dispatch after second run");
-        assert!(dispatch_after.contains("sensor_msgs/msg/Imu"),
-            "append mode: existing entries should be preserved");
-        assert!(dispatch_after.contains("lifecycle_msgs/srv/ChangeState_Request"),
-            "append mode: service entries should be preserved");
+        assert!(
+            dispatch_after.contains("nav_msgs/msg/Path"),
+            "append mode: nav_msgs/msg/Path should appear in dispatch after second run"
+        );
+        assert!(
+            dispatch_after.contains("sensor_msgs/msg/Imu"),
+            "append mode: existing entries should be preserved"
+        );
+        assert!(
+            dispatch_after.contains("lifecycle_msgs/srv/ChangeState_Request"),
+            "append mode: service entries should be preserved"
+        );
 
         // Cargo.toml should now include nav_msgs
-        let dispatch_manifest_after = fs::read_to_string(output_dir.join("ros2-dispatch/Cargo.toml"))?;
-        assert!(dispatch_manifest_after.contains("nav_msgs"),
-            "append mode: nav_msgs dependency should be in Cargo.toml");
+        let dispatch_manifest_after =
+            fs::read_to_string(output_dir.join("ros2-dispatch/Cargo.toml"))?;
+        assert!(
+            dispatch_manifest_after.contains("nav_msgs"),
+            "append mode: nav_msgs dependency should be in Cargo.toml"
+        );
 
         Ok(())
     }
